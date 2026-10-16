@@ -20,3 +20,4 @@ MODEL_HUB_QWEN3_EMBEDDING_8B = "/opt/tiger/project/hf_models/Qwen3-Embedding-8B"
 
 # LCRec / OneRec recommendation backbone (not the item encoder).
 MODEL_HUB_QWEN3_06B = "/opt/tiger/project/hf_models/Qwen3-0.6B"
+MODEL_HUB_QWEN3_17B = "/opt/tiger/project/hf_models/Qwen3-1.7B"

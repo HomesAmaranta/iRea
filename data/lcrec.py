@@ -111,7 +111,7 @@ def register_sid_tokens(tokenizer, codebook_size, sem_id_dim):
 class LCSIDCollator:
     """Left-pad prompts; keep target SIDs separate so generation cannot see labels."""
 
-    def __init__(self, tokenizer, sid_token_ids, max_seq_len=20, model_max_length=512,
+    def __init__(self, tokenizer, sid_token_ids, max_seq_len=20, model_max_length=1024,
                  prompt_template=DEFAULT_PROMPT):
         self.tokenizer = tokenizer
         self.sid_token_ids = sid_token_ids

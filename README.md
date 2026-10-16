@@ -121,7 +121,7 @@ sem_ids = quantizer.assign(embeddings).sem_ids  # [N, 3], each code in [0, 255]
 
 - LCRec：Sentence-T5-XL + 与 TIGER 相同的 RQVAE checkpoint，3 层 SID，无额外消歧码。
 - OneRec：Qwen3-Embedding-8B + `rqkmeans.pt`，3 层 SID；其余主干、prompt、LoRA、训练与评估参数与 LCRec 相同。这里的 OneRec 指 LCRec 主干的 RQ-KMeans SID 变体，不是额外移植另一套推荐网络。
-- 两者的推荐主干均为 `/opt/tiger/project/hf_models/Qwen3-0.6B`。不要把用于物品编码的 Qwen3-Embedding-8B 当作推荐主干。
+- 两者的推荐主干均为 `/opt/tiger/project/hf_models/Qwen3-1.7B`。不要把用于物品编码的 Qwen3-Embedding-8B 当作推荐主干。
 
 在 `iRea` 根目录运行；先完成对应的 RQVAE 或 RQ-KMeans 训练：
 
@@ -148,16 +148,15 @@ GPU 编号直接写在各脚本的 `export CUDA_VISIBLE_DEVICES` 中：LCRec 为
 
 ```bash
 python -m trainers.qwen3_trainer config/lcrec.gin --split toys \
-  --gin "train_lcrec.base_model='/opt/tiger/project/hf_models/Qwen3-1.7B'" \
   --gin "train_lcrec.batch_size=8" \
   --gin "train_lcrec.gradient_accumulate_every=16"
 ```
 
-默认 LoRA rank=8、alpha=32、dropout=0.05，训练 `q_proj,v_proj,o_proj,up_proj,down_proj`，同时训练并保存 `embed_tokens,lm_head`。采用 AdamW、lr=`1e-3`、cosine scheduler、200 warmup steps、BF16、梯度检查点、每卡 microbatch=16、梯度累积=8；有效 batch 为 `16 * 8 * GPU 数量`，默认四卡为 512。无 BF16 环境可追加 `--gin "train_lcrec.mixed_precision='no'"`。
+默认 LoRA rank=8、alpha=32、dropout=0.05，训练 `q_proj,v_proj,o_proj,up_proj,down_proj`，同时训练并保存 `embed_tokens,lm_head`。采用 AdamW、lr=`1e-3`、cosine scheduler、200 warmup steps、BF16、梯度检查点、每卡 microbatch=128、梯度累积=1；有效 batch 为 `128 * 1 * GPU 数量`，默认四卡为 512。最大输入长度为 1024 token，推理 beam 数为 20。无 BF16 环境可追加 `--gin "train_lcrec.mixed_precision='no'"`。
 
-数据直接复用 Amazon 的滑窗和 leave-one-out 划分，同一次运行只量化一次物品。历史最大 20 个物品，prompt 为 `What would user be likely to purchase next after buying items {history} ?|start_of_answer|`，SID 注册为 `<a_0><b_1><c_2>` 形式的独立 token。训练只监督目标 SID 和 EOS，不监督 prompt/padding；长度超限只删除完整的最早历史物品，不截断目标。推理只传历史 prompt，默认使用真实 SID 目录的前缀约束 beam search；`constrain_sid=False` 则仅约束每层码本，不约束目录中的组合。
+数据直接复用 Amazon 的滑窗和 leave-one-out 划分，同一次运行只量化一次物品。历史最大 20 个物品，prompt 为 `What would user be likely to purchase next after buying items {history} ?|start_of_answer|`，SID 注册为 `<a_0><b_1><c_2>` 形式的独立 token。训练只监督目标 SID 的 3 个位置，不计算 EOS、prompt/padding 的 loss；长度超限只删除完整的最早历史物品，不截断目标。推理只传历史 prompt，生成 3 个 SID token 后达到长度上限停止；默认使用真实 SID 目录的前缀约束 beam search，`constrain_sid=False` 则仅约束每层码本，不约束目录中的组合。
 
-默认最多训练 10 个 epoch，每个 epoch 验证一次，连续 2 次验证 CE 无严格降低则早停。CE 包含目标 SID 与 EOS、排除辅助对齐损失；`--gin "train_lcrec.early_stop_metric='hr'"` 切回 Recall@最大 K。仅在验证指标刷新最优时，用 `copy.deepcopy` 保留的内存最优模型测试一次；验证无改善不测试，训练结束也不再测试、不从磁盘重载。最终结果复用最后一次验证刷新最优时的测试指标，测试表现不参与选模或早停。SID 碰撞不会自动消歧，Recall/NDCG 与现有三个模型一样按完整 SID 匹配，不是唯一 ItemID 匹配。
+默认最多训练 10 个 epoch，每个 epoch 验证一次，连续 2 次验证 CE 无严格降低则早停。验证 CE 只包含目标 SID，排除 EOS 和辅助对齐损失；`--gin "train_lcrec.early_stop_metric='hr'"` 切回 Recall@最大 K。仅在验证指标刷新最优时，用 `copy.deepcopy` 保留的内存最优模型测试一次；验证无改善不测试，训练结束也不再测试、不从磁盘重载。最终结果复用最后一次验证刷新最优时的测试指标，测试表现不参与选模或早停。SID 碰撞不会自动消歧，Recall/NDCG 与现有三个模型一样按完整 SID 匹配，不是唯一 ItemID 匹配。
 
 辅助对齐默认关闭，通过 `train_lcrec.mse_loss_weight` 开启。`align_target` 支持 `item/quantized`，LCRec 额外支持 `latent`；`align_item` 支持 `current/next`。`align_source` 支持 `last_inp`（答案分隔符前一位置）、`last_out`（分隔符位置）、`mean_out`（预测 SID 各 token 的位置均值），损失支持 `cos/gram`；Gram 在本卡 microbatch 内计算。默认与参考一样为 `quantized/current/last_inp/cos`。
 

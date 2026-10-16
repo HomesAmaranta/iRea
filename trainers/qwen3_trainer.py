@@ -19,7 +19,7 @@ from trainers.trainer_utils import save_run_results, set_seed, setup_accelerator
 
 
 @torch.no_grad()
-def evaluate_lm(model, loader, accelerator, metric="ce", beam_size=30,
+def evaluate_lm(model, loader, accelerator, metric="ce", beam_size=20,
                 top_ks=(5, 10), constrain_sid=True):
     """Gather per-example values, trimming distributed sampler padding."""
     was_training = model.training
@@ -69,7 +69,7 @@ def evaluate_lm(model, loader, accelerator, metric="ce", beam_size=30,
 def train_lcrec(
     model_name="lcrec",
     quantizer="rqvae",
-    base_model="/opt/tiger/project/hf_models/Qwen3-0.6B",
+    base_model="/opt/tiger/project/hf_models/Qwen3-1.7B",
     encoder_model_name="/opt/tiger/project/hf_models/sentence-t5-xl",
     dataset_folder="dataset/amazon",
     pretrained_rqvae_path="out/tiger/amazon/{split}/rqvae/checkpoint_epoch_4999.pt",
@@ -79,10 +79,10 @@ def train_lcrec(
     codebook_size=256,
     sem_id_dim=3,
     max_seq_len=20,
-    model_max_length=512,
+    model_max_length=1024,
     prompt_template=DEFAULT_PROMPT,
     epochs=10,
-    batch_size=16,
+    batch_size=128,
     infer_batch_size=8,
     gradient_accumulate_every=1,
     learning_rate=1e-3,
@@ -98,7 +98,7 @@ def train_lcrec(
     early_stop_metric="ce",
     early_stop_patience=2,
     eval_valid_every_n_epochs=1,
-    beam_size=30,
+    beam_size=20,
     top_ks=(5, 10),
     constrain_sid=True,
     mixed_precision="bf16",

@@ -55,8 +55,8 @@ class LCRec(nn.Module):
         prompt_ids, targets = batch["input_ids"], batch["labels"]
         if targets.ndim != 2 or targets.shape[1] != self.sem_id_dim:
             raise ValueError("Targets must be complete SID token sequences")
-        # The separator predicts SID[0], the last SID token predicts EOS.
-        # Prompt positions and padding are never included in the CE objective.
+        # The separator predicts SID[0]; supervise only SID prediction positions.
+        # The final SID's next-token logits (EOS), prompt and padding are excluded.
         input_ids = torch.cat((prompt_ids, targets), dim=1)
         mask = torch.cat((batch["attention_mask"], torch.ones_like(targets)), dim=1)
         positions = mask.cumsum(-1) - 1
@@ -67,13 +67,10 @@ class LCRec(nn.Module):
             use_cache=False, output_hidden_states=use_alignment, return_dict=True,
             logits_to_keep=self.sem_id_dim + 1,
         )
-        logits = outputs.logits[:, -(self.sem_id_dim + 1):].float()
-        labels = torch.cat((
-            targets, targets.new_full((len(targets), 1), self.eos_token_id)
-        ), dim=1)
+        logits = outputs.logits[:, -(self.sem_id_dim + 1):-1].float()
         per_example = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), reduction="none"
-        ).view_as(labels).mean(dim=1)
+            logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction="none"
+        ).view_as(targets).mean(dim=1)
         align_loss = per_example.new_zeros(())
         if use_alignment:
             target = batch.get("align_target_emb")
@@ -103,7 +100,7 @@ class LCRec(nn.Module):
         return LCRecOutput(per_example.mean(), per_example, align_loss)
 
     @torch.no_grad()
-    def generate(self, batch, num_beams=30, constrain_sid=True):
+    def generate(self, batch, num_beams=20, constrain_sid=True):
         prompt_width = batch["input_ids"].shape[1]
         layer_tokens = self.sid_token_ids.tolist()
 
