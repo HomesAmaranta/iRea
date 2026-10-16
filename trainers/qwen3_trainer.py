@@ -2,8 +2,10 @@
 
 import copy
 import json
+import logging
 import math
 import os
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 import gin
 import torch
@@ -16,6 +18,59 @@ from data.lcrec import DEFAULT_PROMPT, LCSIDCollator, load_lm_datasets, register
 from models.lcrec import build_lcrec
 from modules.utils import get_run_split, parse_config, setup_logger
 from trainers.trainer_utils import save_run_results, set_seed, setup_accelerator
+
+
+def setup_training_logger(accelerator, save_dir, config, paths):
+    name = config["model_name"]
+    if config["mse_loss_weight"] > 0:
+        name += (
+            f"_{config['align_target']}_{config['align_item']}"
+            f"_{config['align_loss_type']}{config['mse_loss_weight']:g}_{config['align_source']}"
+        )
+    if not accelerator.is_main_process:
+        # No file/console handlers on workers, including when root logging is enabled.
+        logger = logging.Logger(name)
+        logger.disabled = True
+        logger.propagate = False
+        return logger
+    logger = setup_logger(save_dir, name=name)
+    logger.propagate = False
+    effective = dict(config)
+    for key in ("dataset_folder", "pretrained_rqvae_path", "pretrained_rqkmeans_path"):
+        effective[key] = config[key].format(**paths)
+    effective.update(split=paths["split"], save_dir_root=save_dir)
+    logger.info("Effective training arguments:\n%s", json.dumps(effective, indent=2))
+    logger.info("Alignment: %s", {key: config[key] for key in (
+        "align_target", "align_item", "mse_loss_weight", "align_source", "align_loss_type",
+    )})
+    logger.info(
+        "Batch: per-device=%d, accumulation=%d, world_size=%d, effective=%d",
+        config["batch_size"], config["gradient_accumulate_every"], accelerator.num_processes,
+        config["batch_size"] * config["gradient_accumulate_every"] * accelerator.num_processes,
+    )
+    return logger
+
+
+@contextmanager
+def main_process_loading_output(accelerator):
+    """Keep third-party loading prints/progress on rank zero; exceptions still propagate."""
+    if accelerator.is_main_process:
+        yield
+    else:
+        with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
+            yield
+
+
+def aggregate_training_log(accelerator, epoch, ce_total, align_total, count, weight):
+    # Every rank must participate, even though only rank zero emits the result.
+    totals = accelerator.reduce(
+        torch.tensor([ce_total, align_total, count], device=accelerator.device, dtype=torch.float64),
+        reduction="sum",
+    ).tolist()
+    if totals[2] <= 0:
+        raise ValueError("No training samples")
+    ce, align = totals[0] / totals[2], totals[1] / totals[2]
+    return {"epoch": epoch, "train/ce": ce, "train/align": align, "train/loss": ce + weight * align}
 
 
 @torch.no_grad()
@@ -141,9 +196,9 @@ def train_lcrec(
     save_dir = save_dir_root.format(**paths)
     if mse_loss_weight > 0:
         save_dir += f"_{align_target}_{align_item}_{align_source}_{align_loss_type}{mse_loss_weight:g}"
-    logger = setup_logger(save_dir, name=f"{model_name}_{accelerator.process_index}")
+    logger = setup_training_logger(accelerator, save_dir, run_config, paths)
     # Let rank zero populate missing embedding caches before other ranks read them.
-    with accelerator.main_process_first():
+    with accelerator.main_process_first(), main_process_loading_output(accelerator):
         datasets = load_lm_datasets(
             root=dataset_folder.format(**paths), split=paths["split"], max_seq_len=max_seq_len,
             quantizer=quantizer, encoder_model_name=encoder_model_name,
@@ -154,7 +209,8 @@ def train_lcrec(
         )
     if any(len(value) == 0 for value in datasets.values()):
         raise ValueError("Train, valid and test datasets must all be nonempty")
-    tokenizer = AutoTokenizer.from_pretrained(base_model, padding_side="left")
+    with main_process_loading_output(accelerator):
+        tokenizer = AutoTokenizer.from_pretrained(base_model, padding_side="left")
     if tokenizer.eos_token_id is None:
         raise ValueError("Base tokenizer must define EOS")
     # Match the reference, but use attention masks rather than token IDs to mask padding.
@@ -175,13 +231,14 @@ def train_lcrec(
     align_dim = len(target) if mse_loss_weight > 0 and target is not None else None
     if mse_loss_weight > 0 and align_dim is None:
         raise ValueError("The training dataset must supply alignment vectors")
-    model = build_lcrec(
-        base_model, tokenizer, sid_token_ids, datasets["train"].sem_ids_list,
-        mixed_precision=mixed_precision, lora_r=lora_r, lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout, lora_target_modules=lora_target_modules,
-        gradient_checkpointing=gradient_checkpointing, align_dim=align_dim,
-        align_source=align_source, align_loss_type=align_loss_type,
-    )
+    with main_process_loading_output(accelerator):
+        model = build_lcrec(
+            base_model, tokenizer, sid_token_ids, datasets["train"].sem_ids_list,
+            mixed_precision=mixed_precision, lora_r=lora_r, lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout, lora_target_modules=lora_target_modules,
+            gradient_checkpointing=gradient_checkpointing, align_dim=align_dim,
+            align_source=align_source, align_loss_type=align_loss_type,
+        )
     optimizer = AdamW((p for p in model.parameters() if p.requires_grad),
                       lr=learning_rate, weight_decay=weight_decay)
     model, optimizer, *prepared = accelerator.prepare(
@@ -233,8 +290,13 @@ def train_lcrec(
             ce_total += output.loss.item() * size
             align_total += output.align_loss.item() * size
             count += size
-        log = {"epoch": epoch, "train/ce": ce_total / count, "train/align": align_total / count}
-        logger.info(str(log))
+        log = aggregate_training_log(
+            accelerator, epoch, ce_total, align_total, count, mse_loss_weight
+        )
+        logger.info(
+            f"Epoch {epoch} - loss: {log['train/loss']:.6f}, "
+            f"ntp: {log['train/ce']:.6f}, align: {log['train/align']:.6f}"
+        )
         if epoch == 0 or (epoch + 1) % eval_valid_every_n_epochs == 0:
             # Remove AMP's bound forward wrapper before copying; explicit autocast
             # contexts above/below continue to control precision without aliasing it.
@@ -265,10 +327,11 @@ def train_lcrec(
             else:
                 wait += 1
             log.update({f"valid/{key}": value for key, value in valid.items()})
-            logger.info(f"Valid: {valid}; best epoch: {best_epoch}; wait: {wait}")
+            logger.info(f"Epoch {epoch} - Valid: {valid}; best epoch: {best_epoch}; wait: {wait}")
         if wandb is not None:
             wandb.log(log)
         if wait >= early_stop_patience:
+            logger.info(f"Early stopping at epoch {epoch}; best epoch: {best_epoch}")
             break
     if best_test is None:
         raise RuntimeError("No best model selected")
