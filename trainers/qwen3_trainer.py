@@ -185,7 +185,9 @@ def train_lcrec(
         raise ValueError("Invalid alignment target or item")
     if quantizer == "rqkmeans" and align_target == "latent" and mse_loss_weight > 0:
         raise ValueError("RQ-KMeans has no latent target; use item or quantized")
-    if align_source not in ("last_inp", "last_out", "mean_out") or align_loss_type not in ("cos", "gram"):
+    if align_source not in ("last_inp", "last_out", "mean_out") or align_loss_type not in (
+        "cos", "gram", "cosgram"
+    ):
         raise ValueError("Invalid alignment source or loss")
     set_seed(seed)
     accelerator = setup_accelerator(

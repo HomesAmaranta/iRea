@@ -15,8 +15,8 @@ class SASRec(SIDModelMixin, nn.Module):
 
     Each of ``num_blocks`` decoder blocks contains one causal self-attention
     sublayer and one FFN. Only the first block has relative position bias.
-    The shared decoder RMSNorm and dropout run after every block, following
-    the supplied decoder loop. Checkpoints from the old backbone are incompatible.
+    Each sublayer uses pre-RMSNorm; final RMSNorm and dropout run once after
+    the complete decoder stack. Checkpoints from the old backbone are incompatible.
     """
 
     def __init__(
@@ -27,7 +27,7 @@ class SASRec(SIDModelMixin, nn.Module):
         num_heads: int = 4,
         num_blocks: int = 4,
         ffn_dim: int = 256,
-        dropout: float = 0.2,
+        dropout: float = 0.1,
         loss_type: str = "bce",  # "bce" (original paper) or "ce" (cross-entropy)
         codebook_size: Optional[int] = None,
         sem_id_dim: int = 3,
@@ -87,7 +87,7 @@ class SASRec(SIDModelMixin, nn.Module):
                 present.append(kv)
             else:
                 x = block(x, mask)
-            x = self.dropout(self.decoder_final_layer_norm(x))
+        x = self.dropout(self.decoder_final_layer_norm(x))
 
         if use_cache:
             return x, (tuple(present), key_mask)

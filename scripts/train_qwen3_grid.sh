@@ -9,7 +9,7 @@ mse_loss_weights=(5)
 align_items=(current)
 align_sources=(last_inp)
 learning_rates=(5e-4)
-align_loss_type=cos
+align_loss_type=cos # cos | gram | cosgram (0.5*cos + 0.5*gram)
 gpu_ids="0,1,2,3"
 
 # Pass the four visible GPUs above to each model's bash launcher.
@@ -39,7 +39,7 @@ done
 for source in "${align_sources[@]}"; do
   case "$source" in last_inp|last_out|mean_out) ;; *) echo "Unsupported source: $source" >&2; exit 2 ;; esac
 done
-case "$align_loss_type" in cos|gram) ;; *) echo "Unsupported loss: $align_loss_type" >&2; exit 2 ;; esac
+case "$align_loss_type" in cos|gram|cosgram) ;; *) echo "Unsupported loss: $align_loss_type" >&2; exit 2 ;; esac
 for number in "${mse_loss_weights[@]}" "${learning_rates[@]}"; do
   if [[ ! "$number" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
     echo "Invalid nonnegative numeric value: $number" >&2

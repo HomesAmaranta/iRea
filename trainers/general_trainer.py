@@ -44,20 +44,35 @@ def configure_alignment(model, target_dim):
     ).to(device=embedding.weight.device, dtype=embedding.weight.dtype)
 
 
-def compute_alignment_loss(model, output, inp):
+def compute_alignment_loss(model, output, inp, align_loss_type="cos"):
     """Align the first target-prediction slot to a frozen current/next item vector."""
+    if align_loss_type not in ("cos", "gram", "cosgram"):
+        raise ValueError("align_loss_type must be cos, gram or cosgram")
     # SASRec/HSTU: b_last. TIGER: decoder start PAD, before reading any target code.
     hidden = output.last_hidden_state[:, 0, :]
     target = inp.get("align_target_emb")
     if target is None:
         raise ValueError("Alignment requires align_target_emb")
+    if align_loss_type in ("gram", "cosgram"):
+        if target.ndim != 2 or target.shape[0] != hidden.shape[0]:
+            raise ValueError("Gram alignment requires one target vector per sample")
+        # Batch-wise cosine Gram matrices allow different hidden/target dimensions.
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            prediction = F.normalize(hidden.float(), dim=-1, eps=1e-8)
+            reference = F.normalize(target.detach().float(), dim=-1, eps=1e-8)
+            gram_loss = F.mse_loss(
+                prediction @ prediction.T, reference @ reference.T, reduction="mean"
+            )
+        if align_loss_type == "gram":
+            return gram_loss
     prediction = model.hidden_to_item_emb(hidden)
     if prediction.shape != target.shape:
         raise ValueError("Projected hidden and alignment target shapes must match")
     # FP32 cosine avoids small-norm instability under mixed precision.
-    return 1.0 - F.cosine_similarity(
+    cos_loss = 1.0 - F.cosine_similarity(
         prediction.float(), target.detach().float(), dim=-1
     ).mean()
+    return 0.5 * cos_loss + 0.5 * gram_loss if align_loss_type == "cosgram" else cos_loss
 
 
 def autocast_context(device, mixed_precision):
@@ -194,8 +209,8 @@ def train(
         raise ValueError("align_target must be item, latent or quantized")
     if align_item not in ("current", "next"):
         raise ValueError("align_item must be current or next")
-    if mse_loss_mode != "last" or align_loss_type != "cos":
-        raise ValueError("Only mse_loss_mode=last and align_loss_type=cos are supported")
+    if mse_loss_mode != "last" or align_loss_type not in ("cos", "gram", "cosgram"):
+        raise ValueError("Only mse_loss_mode=last and align_loss_type=cos/gram/cosgram are supported")
     if not math.isfinite(mse_loss_weight) or mse_loss_weight < 0:
         raise ValueError("mse_loss_weight must be finite and nonnegative")
     alignment_config = dict(
@@ -266,7 +281,8 @@ def train(
         target = getattr(datasets["train"][0], "align_target_emb", None)
         if target is None or torch.as_tensor(target).ndim != 1:
             raise ValueError("Training dataset must provide an align_target_emb vector")
-        configure_alignment(model, len(target))
+        if align_loss_type in ("cos", "cosgram"):
+            configure_alignment(model, len(target))
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = None
     if lr_schedule == "cosine":
@@ -331,7 +347,7 @@ def train(
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, mixed_precision):
                 output = model(inp)
-                align_loss = (compute_alignment_loss(model, output, inp)
+                align_loss = (compute_alignment_loss(model, output, inp, align_loss_type)
                               if mse_loss_weight > 0 else output.logits.new_zeros(()))
             if output.loss is None or not torch.isfinite(output.loss):
                 raise RuntimeError("Model returned a missing or non-finite NTP loss")

@@ -24,14 +24,14 @@ class LCRec(nn.Module):
         super().__init__()
         if align_source not in ("last_inp", "last_out", "mean_out"):
             raise ValueError("align_source must be last_inp, last_out or mean_out")
-        if align_loss_type not in ("cos", "gram"):
-            raise ValueError("align_loss_type must be cos or gram")
+        if align_loss_type not in ("cos", "gram", "cosgram"):
+            raise ValueError("align_loss_type must be cos, gram or cosgram")
         self.backbone = backbone
         self.register_buffer("sid_token_ids", sid_token_ids.clone())
         self.sem_id_dim = sid_token_ids.shape[0]
         self.eos_token_id, self.pad_token_id = eos_token_id, pad_token_id
         self.align_source, self.align_loss_type = align_source, align_loss_type
-        if align_dim is not None and align_loss_type == "cos":
+        if align_dim is not None and align_loss_type in ("cos", "cosgram"):
             hidden_dim = backbone.config.hidden_size
             self.hidden_to_item_emb = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
@@ -87,16 +87,19 @@ class LCRec(nn.Module):
             target = target.detach().float()
             if target.ndim != 2 or target.shape[0] != len(targets) or not torch.isfinite(target).all():
                 raise ValueError("Alignment requires finite vectors, one per sample")
-            if self.align_loss_type == "gram":
+            if self.align_loss_type in ("gram", "cosgram"):
                 with torch.autocast(device_type=selected.device.type, enabled=False):
                     prediction = F.normalize(selected.float(), dim=-1)
-                    target = F.normalize(target, dim=-1)
-                    align_loss = F.mse_loss(prediction @ prediction.T, target @ target.T)
-            else:
+                    reference = F.normalize(target, dim=-1)
+                    gram_loss = F.mse_loss(prediction @ prediction.T, reference @ reference.T)
+                align_loss = gram_loss
+            if self.align_loss_type in ("cos", "cosgram"):
                 prediction = self.hidden_to_item_emb(selected.float()).float()
                 if prediction.shape != target.shape:
                     raise ValueError("Alignment prediction and target dimensions differ")
-                align_loss = 1 - F.cosine_similarity(prediction, target, dim=-1).mean()
+                cos_loss = 1 - F.cosine_similarity(prediction, target, dim=-1).mean()
+                align_loss = (0.5 * cos_loss + 0.5 * gram_loss
+                              if self.align_loss_type == "cosgram" else cos_loss)
         return LCRecOutput(per_example.mean(), per_example, align_loss)
 
     @torch.no_grad()
