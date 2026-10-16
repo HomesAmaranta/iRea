@@ -14,3 +14,6 @@
 # Sentence-T5 models (for text encoding)
 MODEL_HUB_SENTENCE_T5_BASE = "/opt/tiger/project/hf_models/sentence-t5-base"
 MODEL_HUB_SENTENCE_T5_XL = "/opt/tiger/project/hf_models/sentence-t5-xl"
+
+# OneRec RQ-KMeans item encoder
+MODEL_HUB_QWEN3_EMBEDDING_8B = "/opt/tiger/project/hf_models/Qwen3-Embedding-8B"

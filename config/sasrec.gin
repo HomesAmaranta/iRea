@@ -13,15 +13,19 @@ train.batch_size = 128
 train.learning_rate = 1e-3
 train.weight_decay = 0.0
 
-# Default model structure; the SID interface always uses NTP cross-entropy
+# Decoder-only backbone: one causal attention + FFN per block, no context stack.
+# RMSNorm, first-block relative position bias, and a scaled tied output head.
+# The SID interface always uses NTP cross-entropy. Old backbone weights are incompatible.
 train.max_seq_len = 20
 train.embed_dim = 128
 train.num_heads = 4
+train.d_kv = 32
 train.num_blocks = 4
 train.ffn_dim = 256
 train.dropout = 0.1
+train.feed_forward_proj = "relu"
 
-# Shared TIGER sliding-window SID data
+# Shared sliding-window SID data
 train.dataset = @AmazonSeqDataset
 train.dataset_folder = "dataset/amazon"
 train.codebook_size = 256
@@ -39,7 +43,8 @@ train.pretrained_rqvae_path = "out/tiger/amazon/{split}/rqvae/checkpoint_epoch_4
 # General trainer equivalents of the original evaluation settings
 train.eval_valid_every_n_epochs = 1
 train.infer_batch_size = 256
-train.early_stop_patience = 50
+train.early_stop_patience = 10
+train.early_stop_metric = "ce"
 train.beam_size = 30
 train.save_dir_root = "out/sasrec/amazon/{split}/sid"
 train.wandb_logging = True

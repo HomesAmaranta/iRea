@@ -1,0 +1,23 @@
+# OneRec RQ-KMeans recipe from genrec, independent of the shared RQVAE.
+# Run: python -m trainers.rqkmeans_trainer config/rqkmeans.gin --split beauty
+include "config/base.gin"
+
+import data.amazon
+
+fit_rqkmeans.n_layers = 3
+fit_rqkmeans.codebook_size = 256
+fit_rqkmeans.random_state = 42
+fit_rqkmeans.seed = 42
+fit_rqkmeans.max_iter = 100
+fit_rqkmeans.batch_size = 4096
+fit_rqkmeans.backend = "auto"
+fit_rqkmeans.n_init = 10
+fit_rqkmeans.dead_reinit = True
+
+fit_rqkmeans.dataset = @AmazonItemDataset
+fit_rqkmeans.dataset_folder = "dataset/amazon"
+fit_rqkmeans.encoder_model_name = %MODEL_HUB_QWEN3_EMBEDDING_8B
+AmazonItemDataset.split = "{split}"
+AmazonItemDataset.encoder_model_name = %MODEL_HUB_QWEN3_EMBEDDING_8B
+
+fit_rqkmeans.save_dir_root = "out/onerec/amazon/{split}/rqkmeans"

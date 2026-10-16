@@ -57,8 +57,7 @@ class SIDModelMixin:
             hidden = self._encode_sid_sequence(ids, inp)[:, -self.sem_id_dim:, :]
         else:
             hidden = self._encode_sid_sequence(ids, inp)[:, -1:, :]
-        # Deliberately no d_model scaling or normalization of the output head.
-        logits = hidden @ self.item_embedding.weight.T
+        logits = self._lm_logits(hidden)
         loss = None if labels is None else F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), labels.reshape(-1)
         )
@@ -67,13 +66,17 @@ class SIDModelMixin:
     def _encode_sid_sequence(self, ids, inp):
         return self._encode(ids)
 
+    def _lm_logits(self, hidden):
+        """Default tied head; backbones may override their output scaling."""
+        return hidden @ self.item_embedding.weight.T
+
     def _generation_context(self, inp):
         return inp["input_ids"], inp["attention_mask"]
 
     def _next_sid_token(self, context, prefix):
         ids = torch.cat((context[0], prefix), dim=1)
         hidden = self._encode(ids)[:, -1, :]
-        return hidden @ self.item_embedding.weight.T, hidden
+        return self._lm_logits(hidden), hidden
 
     def _next_sid_token_cached(self, context, prefix, cache):
         """Models without incremental decoding retain full-prefix evaluation."""

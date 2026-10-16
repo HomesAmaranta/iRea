@@ -1,6 +1,6 @@
 # iRea
 
-iRea 是 SID 生成式推荐实验代码，包含 TIGER、HSTU、SASRec 和共享的 RQVAE。
+iRea 是 SID 生成式推荐实验代码，包含 TIGER、HSTU、SASRec、共享的 RQVAE，以及 OneRec 的独立 RQ-KMeans 训练入口。
 
 - RQVAE 独立训练，将物品文本 embedding 量化为语义 ID（SID）。
 - 三个推荐模型共用 `trainers.general_trainer`，数据加载、训练目标和评估流程一致。
@@ -86,6 +86,35 @@ out/tiger/amazon/beauty/rqvae/checkpoint_epoch_4999.pt
 
 如果缩短 RQVAE 训练轮数，推荐模型必须改为实际生成的检查点路径。例如训练 10 个 epoch 后使用 `checkpoint_epoch_9.pt`，不能继续读取默认的 `4999`。
 
+### OneRec RQ-KMeans
+
+从 `genrec` 移植的 OneRec RQ 阶段使用残差 K-means，不训练神经网络 encoder/decoder。配置独立放在 `config/rqkmeans.gin`，无需依赖或导入旁边的 `genrec` 项目：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m trainers.rqkmeans_trainer config/rqkmeans.gin \
+  --split beauty
+```
+
+默认配方与源项目一致：Qwen3-Embedding-8B 物品向量、3 层量化、每层 256 个码字、`random_state=42`、`max_iter=100`、`n_init=10`，开启空簇重置。`backend="auto"` 在物品数乘码本大小小于 `5e7` 时使用完整 KMeans，否则使用 MiniBatchKMeans；`batch_size=4096` 是后者的聚类批大小，不是文本编码批大小。聚类在 CPU 上运行，GPU 仅可能用于首次生成 embedding。
+
+编码器路径由 `config/base.gin` 的 `MODEL_HUB_QWEN3_EMBEDDING_8B` 指定，默认 `/opt/tiger/project/hf_models/Qwen3-Embedding-8B`。已有 `dataset/amazon/processed/beauty/item_emb_Qwen3-Embedding-8B.parquet` 时直接复用；否则走现有 AmazonItemDataset 的文本编码流程。缓存与源项目格式相同，可指定源项目数据目录，前提是数据、编码器和物品映射一致：
+
+```bash
+python -m trainers.rqkmeans_trainer config/rqkmeans.gin --split beauty \
+  --gin "fit_rqkmeans.dataset_folder='/opt/tiger/project/genrec/dataset/amazon'"
+```
+
+输出为 `out/onerec/amazon/beauty/rqkmeans/rqkmeans.pt` 和 `results.json`，后者包含 SID 碰撞率、唯一 SID 数、物品数和最大碰撞组大小。权重保持源项目的 centroid 格式，SID 分配接口为：
+
+```python
+from models.rqkmeans import RqKmeans
+
+quantizer = RqKmeans.load("out/onerec/amazon/beauty/rqkmeans/rqkmeans.pt")
+sem_ids = quantizer.assign(embeddings).sem_ids  # [N, 3], each code in [0, 255]
+```
+
+仅加载可信的 checkpoint，兼容格式包含 NumPy pickle 数据。此入口只补充 OneRec 的 RQ 训练，不包含 OneRec SFT，也不会自动将现有三个推荐模型的数据量化器切换为 RQ-KMeans；不要把 `rqkmeans.pt` 传给 `train.pretrained_rqvae_path`。现有 RQVAE 配置和训练流程不变。
+
 ## 4. 选择推荐模型运行
 
 完成 RQVAE 训练后，下面三条命令按需选择，不需要依次运行。
@@ -157,6 +186,7 @@ CUDA_VISIBLE_DEVICES=0 python -m trainers.general_trainer config/hstu.gin \
 | `train.top_ks` | 评估截断位置，默认 `(5, 10)` |
 | `train.constrain_sid` | 是否将每一步限制在对应层的码本词表，默认 `False` |
 | `train.early_stop_patience` | 验证指标连续不提升的次数阈值 |
+| `train.early_stop_metric` | 默认 `"ce"`：验证 CE 越低越好；`"hr"`：验证 `Recall@max(top_ks)` 越高越好 |
 | `train.save_dir_root` | 输出目录；重复使用同一目录会覆盖最佳权重和结果文件 |
 | `train.seed` | 推荐模型训练随机种子，默认 42 |
 
@@ -165,7 +195,8 @@ CUDA_VISIBLE_DEVICES=0 python -m trainers.general_trainer config/hstu.gin \
 - **数据**：使用 TIGER 的滑窗方式，在训练序列内生成“历史物品 SID → 下一物品 SID”样本。每位用户最后一个物品用于测试，倒数第二个用于验证，不加入训练目标。
 - **编码**：各层 SID 使用独立 offset，padding 为 0。默认 SID 长度为 3，当前配置不添加消歧后缀。
 - **目标**：三个推荐模型都使用 teacher forcing 和目标 SID 上的 NTP 交叉熵，不计算历史 token 的 loss，不使用 BCE 或负采样。
-- **模型**：TIGER 保留 T5 encoder-decoder；SASRec、HSTU 保留各自骨干，输出 logits 直接用最后一层 hidden 乘 SID embedding 词表，不额外按 `d_model` 缩放。
+- **模型**：TIGER 保留 T5 encoder-decoder；HSTU 保留原骨干和不缩放的 SID embedding 输出头。
+- **SASRec 主干**：仅保留 Decoder 堆叠，无 Context、无交叉注意力。`train.num_blocks` 是 Decoder block 数，每个 block 为 1 个因果自注意力 + 1 个 FFN。Q/K/V 均来自 RMSNorm 后的输入，Q/K/V/O 投影无 bias，注意力分数不除以 `sqrt(d_kv)`；仅首个 block 使用分桶相对位置 bias，不使用绝对位置 embedding。每个 block 后执行共享的 RMSNorm + Dropout，输出头为 `(hidden / sqrt(embed_dim)) @ embedding.T`。`train.d_kv` 控制每个 head 的维度，`train.feed_forward_proj` 默认 `"relu"`，也支持 `"gated-gelu"`。旧 SASRec 主干 checkpoint 不能直接加载，需要重新训练。
 - **HSTU 位置偏置**：不使用时间戳；距离为 `query位置 − key位置`。query=2 对 keys `[0, 1, 2, 3]` 的位置桶为 `[2, 1, 0, 0]`，未来 key=3 仍被因果掩码屏蔽。
 - **推理**：逐 token 自回归 beam search，固定生成一个完整 SID，不读取目标 label。默认不使用物品前缀树约束；`constrain_sid=True` 也只是按码本层限制词表，不保证生成结果对应真实物品。
 - **评估**：按完整 SID 匹配计算 Recall、NDCG，不是原始 item ID 的全物品打分。不同物品 SID 相同时无法区分，结果需结合 RQVAE 碰撞率解读。
@@ -174,7 +205,7 @@ CUDA_VISIBLE_DEVICES=0 python -m trainers.general_trainer config/hstu.gin \
 
 SASRec 和 TIGER 在 `eval()` 模式的 SID 生成中默认启用 KV cache，启动命令不用改：
 
-- SASRec 首步计算历史并缓存每层 K/V，之后只输入新生成的一个 token，位置编号延续历史长度。
+- SASRec 首步计算历史并缓存每层 K/V，之后只输入新生成的一个 token，因果 mask 和相对位置 bias 的 query 偏移延续历史长度。
 - TIGER 的 encoder 只计算一次，decoder 缓存 self-attention 和 cross-attention K/V，之后只输入新增 token。
 - beam search 每步选择父 beam 后会同步复制、重排缓存；缓存仅属于本次调用，不写入检查点。
 - HSTU 仍使用完整前缀重算；训练前向不使用缓存。BF16 下缓存与重算可能有小幅浮点差异，接近同分的 beam 顺序可能变化。
@@ -221,7 +252,9 @@ python -m trainers.general_trainer config/tiger.gin --split beauty \
 | HSTU | `out/hstu/amazon/beauty/sid/` |
 | SASRec | `out/sasrec/amazon/beauty/sid/` |
 
-推荐模型目录中包含 `best_model.pt`、`results.json` 和训练日志。默认按验证集 `Recall@10` 选最佳模型，训练结束会重新加载最佳权重并计算测试指标。`best_model.pt` 只保存模型权重，当前 `general_trainer` 没有独立的断点续训或仅评估命令行入口。
+推荐模型目录中包含 `best_model.pt`、`results.json` 和训练日志。三个推荐模型默认按验证集 CE 最低值选最佳模型，连续 10 次验证无严格改善则早停。CE 验证使用 teacher forcing，只计算目标 SID 的平均交叉熵，不包含 alignment loss，不运行 beam search。追加 `--gin "train.early_stop_metric='hr'"` 可切回验证集 `Recall@max(top_ks)`（默认 `Recall@10`）最高值选模；每个样本只有一个目标 SID，因此此处 HR 与 Recall 相同。
+
+训练期间不评估测试集。验证指标刷新最优时，通过 `best_model = copy.deepcopy(model).eval()` 保留独立的完整模型副本，设备与训练模型相同，因此会额外占用一份模型的内存或显存。训练结束直接使用 `best_model`，仅计算一次测试集 Recall/NDCG，不再从磁盘加载。仍保存 `best_model.pt` 权重文件供后续使用。`results.json` 记录 `early_stop_metric`、`best_valid_metric`、`best_valid_value`；未计算的 `best_valid_ce` 或 `best_valid_recall` 为 `null`。`best_model.pt` 只保存模型权重，当前 `general_trainer` 没有独立的断点续训或仅评估命令行入口。
 
 ## 8. 目录与运行检查
 
@@ -230,6 +263,7 @@ iRea/
   config/
     base.gin           # 文本编码器路径
     rqvae.gin          # 共享 RQVAE 配置
+    rqkmeans.gin       # OneRec RQ-KMeans 配置
     tiger.gin
     hstu.gin
     sasrec.gin
@@ -239,6 +273,7 @@ iRea/
   trainers/
     general_trainer.py
     rqvae_trainer.py
+    rqkmeans_trainer.py
     trainer_utils.py
   scripts/
     train.sh           # 单任务启动
@@ -253,6 +288,7 @@ iRea/
 ```bash
 python -m trainers.general_trainer --help
 python -m trainers.rqvae_trainer --help
+python -m trainers.rqkmeans_trainer --help
 ```
 
 运行 KV cache 和对齐回归测试，不需要检查点或下载数据；有可用 GPU 时额外验证缓存的 FP32/BF16：
