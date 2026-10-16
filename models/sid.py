@@ -75,8 +75,22 @@ class SIDModelMixin:
         hidden = self._encode(ids)[:, -1, :]
         return hidden @ self.item_embedding.weight.T, hidden
 
+    def _next_sid_token_cached(self, context, prefix, cache):
+        """Models without incremental decoding retain full-prefix evaluation."""
+        logits, hidden = self._next_sid_token(context, prefix)
+        return logits, hidden, None
+
+    @staticmethod
+    def _reorder_generation_cache(cache, indices):
+        """Select parent beams, including duplicated parents, in nested KV state."""
+        if cache is None:
+            return None
+        if isinstance(cache, torch.Tensor):
+            return cache.index_select(0, indices)
+        return tuple(SIDModelMixin._reorder_generation_cache(value, indices) for value in cache)
+
     @torch.no_grad()
-    def generate(self, inp, num_beams=20, constrain_sid=False):
+    def generate(self, inp, num_beams=20, constrain_sid=False, use_cache=True):
         """Generate complete SIDs; inference never reads inp['labels']."""
         self._validate_inp(inp)
         vocab_size = self.codebook_size * self.sem_id_dim + 1
@@ -88,15 +102,20 @@ class SIDModelMixin:
         base_context = self._generation_context(inp)
         sequences = torch.empty(batch_size, 1, 0, device=device, dtype=torch.long)
         scores = torch.zeros(batch_size, 1, device=device)
+        # Dropout makes cached and recomputed prefixes inequivalent in train mode.
+        use_cache = use_cache and not self.training
+        cache = None
 
         for step in range(self.sem_id_dim):
             beam_count = sequences.shape[1]
             context = tuple(
                 value.repeat_interleave(beam_count, dim=0) for value in base_context
             )
-            logits, hidden = self._next_sid_token(
-                context, sequences.reshape(batch_size * beam_count, step)
-            )
+            prefix = sequences.reshape(batch_size * beam_count, step)
+            if use_cache:
+                logits, hidden, cache = self._next_sid_token_cached(context, prefix, cache)
+            else:
+                logits, hidden = self._next_sid_token(context, prefix)
             log_probs = F.log_softmax(logits.float(), dim=-1)
             log_probs[:, 0] = -torch.inf  # 0 is padding/start, never a SID code.
             if constrain_sid:
@@ -110,6 +129,9 @@ class SIDModelMixin:
             scores, indices = candidates.reshape(batch_size, -1).topk(num_beams, dim=-1)
             parents = indices // vocab_size
             tokens = indices % vocab_size
+            if cache is not None and step + 1 < self.sem_id_dim:
+                offsets = torch.arange(batch_size, device=device).unsqueeze(1) * beam_count
+                cache = self._reorder_generation_cache(cache, (parents + offsets).reshape(-1))
             sequences = sequences.gather(
                 1, parents.unsqueeze(-1).expand(-1, -1, step)
             )

@@ -1,12 +1,15 @@
 """Shared target-only SID NTP training for TIGER, SASRec and HSTU."""
 
 import json
+import math
 import os
 from contextlib import nullcontext
 from functools import partial
 
 import gin
 import torch
+from torch import nn
+from torch.nn import functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -22,8 +25,38 @@ def move_batch(batch, device, include_labels=True):
     return {
         key: value.to(device, non_blocking=True)
         for key, value in batch.items()
-        if include_labels or key != "labels"
+        if include_labels or key not in ("labels", "align_target_emb")
     }
+
+
+def configure_alignment(model, target_dim):
+    """Register the reference MLP before creating the optimizer/checkpoint."""
+    if target_dim <= 0:
+        raise ValueError("Alignment target dimension must be positive")
+    embedding = (model.model.get_input_embeddings() if hasattr(model, "model")
+                 else model.item_embedding)
+    hidden_dim = embedding.weight.shape[1]
+    model.hidden_to_item_emb = nn.Sequential(
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.GELU(),
+        nn.Linear(hidden_dim, target_dim, bias=False),
+    ).to(device=embedding.weight.device, dtype=embedding.weight.dtype)
+
+
+def compute_alignment_loss(model, output, inp):
+    """Align the first target-prediction slot to a frozen current/next item vector."""
+    # SASRec/HSTU: b_last. TIGER: decoder start PAD, before reading any target code.
+    hidden = output.last_hidden_state[:, 0, :]
+    target = inp.get("align_target_emb")
+    if target is None:
+        raise ValueError("Alignment requires align_target_emb")
+    prediction = model.hidden_to_item_emb(hidden)
+    if prediction.shape != target.shape:
+        raise ValueError("Projected hidden and alignment target shapes must match")
+    # FP32 cosine avoids small-norm instability under mixed precision.
+    return 1.0 - F.cosine_similarity(
+        prediction.float(), target.detach().float(), dim=-1
+    ).mean()
 
 
 def autocast_context(device, mixed_precision):
@@ -111,6 +144,11 @@ def train(
     wandb_logging=False,
     wandb_project="{model}_{split}_training",
     wandb_log_interval=10,
+    align_target="quantized",
+    align_item="current",
+    mse_loss_weight=0.0,
+    mse_loss_mode="last",
+    align_loss_type="cos",
 ):
     if min(epochs, batch_size, infer_batch_size, early_stop_patience,
            eval_valid_every_n_epochs, eval_test_every_epoch, wandb_log_interval) <= 0:
@@ -121,6 +159,18 @@ def train(
         raise ValueError("Invalid worker count or learning-rate schedule")
     if not top_ks or min(top_ks) <= 0 or max(top_ks) > beam_size:
         raise ValueError("Evaluation k values must be positive and <= beam_size")
+    if align_target not in ("item", "latent", "quantized"):
+        raise ValueError("align_target must be item, latent or quantized")
+    if align_item not in ("current", "next"):
+        raise ValueError("align_item must be current or next")
+    if mse_loss_mode != "last" or align_loss_type != "cos":
+        raise ValueError("Only mse_loss_mode=last and align_loss_type=cos are supported")
+    if not math.isfinite(mse_loss_weight) or mse_loss_weight < 0:
+        raise ValueError("mse_loss_weight must be finite and nonnegative")
+    alignment_config = dict(
+        align_target=align_target, align_item=align_item, mse_loss_weight=mse_loss_weight,
+        mse_loss_mode=mse_loss_mode, align_loss_type=align_loss_type,
+    )
     model_config = dict(model_config or {})
     architecture = {
         "tiger": dict(num_layers=num_layers, num_decoder_layers=num_decoder_layers,
@@ -142,7 +192,13 @@ def train(
     paths = {"model": model_name, "split": get_run_split("beauty")}
     save_dir_root = save_dir_root.format(**paths)
     pretrained_rqvae_path = pretrained_rqvae_path.format(**paths)
-    logger = setup_logger(save_dir_root, name=model_name)
+    artifact_suffix = ""
+    if mse_loss_weight > 0:
+        weight_tag = str(mse_loss_weight).removesuffix(".0")
+        artifact_suffix = (
+            f"_{align_target}_{align_item}_{align_loss_type}{weight_tag}_{mse_loss_mode}"
+        )
+    logger = setup_logger(save_dir_root, name=f"{model_name}{artifact_suffix}")
 
     if dataset is None:
         from data.amazon import AmazonSeqDataset
@@ -151,6 +207,8 @@ def train(
         split: dataset(
             root=dataset_folder, train_test_split=split, max_seq_len=max_seq_len,
             pretrained_rqvae_path=pretrained_rqvae_path,
+            **(dict(align_target=align_target, align_item=align_item)
+               if split == "train" and mse_loss_weight > 0 else {}),
         )
         for split in ("train", "valid", "test")
     }
@@ -172,6 +230,11 @@ def train(
     model = build_sid_model(
         model_name, codebook_size, sem_id_dim, max_seq_len, model_config
     ).to(device)
+    if mse_loss_weight > 0:
+        target = getattr(datasets["train"][0], "align_target_emb", None)
+        if target is None or torch.as_tensor(target).ndim != 1:
+            raise ValueError("Training dataset must provide an align_target_emb vector")
+        configure_alignment(model, len(target))
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = None
     if lr_schedule == "cosine":
@@ -192,6 +255,7 @@ def train(
         f"Params: {sum(p.numel() for p in model.parameters()):,}, "
         f"Samples: { {key: len(value) for key, value in datasets.items()} }"
     )
+    logger.info(f"Alignment: {alignment_config}")
     wandb = None
     if wandb_logging:
         import wandb
@@ -202,6 +266,7 @@ def train(
                 "codebook_size": codebook_size, "sem_id_dim": sem_id_dim,
                 "max_seq_len": max_seq_len, "learning_rate": learning_rate,
                 "batch_size": batch_size, "beam_size": beam_size, "seed": seed,
+                **alignment_config,
             },
         )
 
@@ -210,7 +275,7 @@ def train(
     wait = 0
     global_step = 0
     monitor = f"Recall@{max(top_ks)}"
-    best_path = os.path.join(save_dir_root, "best_model.pt")
+    best_path = os.path.join(save_dir_root, f"best_model{artifact_suffix}.pt")
     eval_kwargs = dict(
         device=device, beam_size=beam_size, top_ks=top_ks,
         constrain_sid=constrain_sid, mixed_precision=mixed_precision,
@@ -218,27 +283,46 @@ def train(
     for epoch in range(epochs):
         model.train()
         loss_sum = 0.0
+        ntp_loss_sum = 0.0
+        align_loss_sum = 0.0
         sample_count = 0
         for batch in tqdm(loaders["train"], desc=f"Epoch {epoch}"):
             inp = move_batch(batch, device)
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, mixed_precision):
                 output = model(inp)
+                align_loss = (compute_alignment_loss(model, output, inp)
+                              if mse_loss_weight > 0 else output.logits.new_zeros(()))
             if output.loss is None or not torch.isfinite(output.loss):
                 raise RuntimeError("Model returned a missing or non-finite NTP loss")
-            output.loss.backward()
+            loss = output.loss + mse_loss_weight * align_loss
+            if not torch.isfinite(loss):
+                raise RuntimeError("Non-finite combined alignment loss")
+            loss.backward()
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             size = inp["labels"].shape[0]
-            loss_sum += output.loss.item() * size
+            loss_sum += loss.item() * size
+            ntp_loss_sum += output.loss.item() * size
+            align_loss_sum += align_loss.item() * size
             sample_count += size
             global_step += 1
             if wandb is not None and global_step % wandb_log_interval == 0:
-                wandb.log({"global_step": global_step, "train/loss": output.loss.item()})
+                wandb.log({
+                    "global_step": global_step, "train/loss": loss.item(),
+                    "train/ntp_loss": output.loss.item(), "train/align_loss": align_loss.item(),
+                })
 
-        log = {"epoch": epoch, "train/loss": loss_sum / sample_count}
-        logger.info(f"Epoch {epoch} - loss: {log['train/loss']:.6f}")
+        log = {
+            "epoch": epoch, "train/loss": loss_sum / sample_count,
+            "train/ntp_loss": ntp_loss_sum / sample_count,
+            "train/align_loss": align_loss_sum / sample_count,
+        }
+        logger.info(
+            f"Epoch {epoch} - loss: {log['train/loss']:.6f}, "
+            f"ntp: {log['train/ntp_loss']:.6f}, align: {log['train/align_loss']:.6f}"
+        )
         if epoch == 0 or (epoch + 1) % eval_valid_every_n_epochs == 0:
             valid = evaluate(model, loaders["valid"], desc="Valid", **eval_kwargs)
             logger.info(f"Epoch {epoch} - Valid: {valid}")
@@ -266,6 +350,7 @@ def train(
         "best_valid_recall": best_recall, "test": final_test,
         "model_config": model_config or {}, "codebook_size": codebook_size,
         "sem_id_dim": sem_id_dim, "max_seq_len": max_seq_len,
+        **alignment_config,
     }
     with open(os.path.join(save_dir_root, "results.json"), "w") as handle:
         json.dump(results, handle, indent=2)

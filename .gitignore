@@ -209,3 +209,9 @@ video/
 assets/
 reference/
 GRLM/
+
+scripts/
+
+tests/
+
+.dbg/

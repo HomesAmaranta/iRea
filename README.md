@@ -118,6 +118,21 @@ CUDA_VISIBLE_DEVICES=4 python -m trainers.general_trainer config/sasrec.gin \
 
 HSTU、SASRec 默认使用 BF16，TIGER 默认不启用混合精度。不支持 BF16 的设备可追加 `--gin "train.mixed_precision='no'"`；该参数属于 `general_trainer`，不要直接用于 RQVAE trainer。
 
+### 脚本与批量提交
+
+`scripts/train.sh` 接收模型名、数据集名，并透传后续 `--gin` 参数；默认关闭 W&B。脚本不设置或覆盖 GPU 可见性，由 `mytask` 分配设备。
+
+```bash
+cd /opt/tiger/project/iRea/scripts
+bash train_grid.sh
+```
+
+三个模型分别读取各自的 gin 结构参数；这里遍历的是三种模型，不额外搜索层数或维度。每个数据集需要先准备好对应的 RQVAE 检查点，批量脚本不会启动 RQVAE 训练。
+
+使用本机自动分卡时，先自行执行 `mytask workers local`；已有远程 worker 配置时按现有配置调度。脚本不修改调度器配置。重复提交会使用相同的模型输出目录，请避免相同模型、数据集的任务并发覆盖结果。
+
+两个脚本都直接写 `cd /opt/tiger/project/iRea`，不依赖启动位置或 `mytask` 副本所在目录。没有 help 或 dry-run 分支，执行 `bash train_grid.sh` 就会提交全部 9 个任务；模型和数据集列表直接在脚本里修改。
+
 ## 5. 常用参数覆盖
 
 `--gin` 可以重复传入。下面示例在已有 RQVAE 的前提下，用 HSTU 跑一个完整 epoch 检查流程；它仍会加载全量数据并执行验证、测试：
@@ -157,6 +172,46 @@ CUDA_VISIBLE_DEVICES=0 python -m trainers.general_trainer config/hstu.gin \
 
 统一接口为 `model(inp)`，返回 `loss`、`logits`、`last_hidden_state`；推理调用 `model.generate(inp, num_beams=...)`。
 
+SASRec 和 TIGER 在 `eval()` 模式的 SID 生成中默认启用 KV cache，启动命令不用改：
+
+- SASRec 首步计算历史并缓存每层 K/V，之后只输入新生成的一个 token，位置编号延续历史长度。
+- TIGER 的 encoder 只计算一次，decoder 缓存 self-attention 和 cross-attention K/V，之后只输入新增 token。
+- beam search 每步选择父 beam 后会同步复制、重排缓存；缓存仅属于本次调用，不写入检查点。
+- HSTU 仍使用完整前缀重算；训练前向不使用缓存。BF16 下缓存与重算可能有小幅浮点差异，接近同分的 beam 顺序可能变化。
+
+对照时可调用 `model.generate(inp, num_beams=30, use_cache=False)` 关闭 SID 生成缓存。直接调用前需要 `model.eval()`；`general_trainer` 的评估已自动处理。
+
+### 可选 Align Loss
+
+默认 `train.mse_loss_weight=0`，只训练 NTP。开启后总损失为：
+`NTP + mse_loss_weight * (1 - mean(cos(MLP(hidden), target)))`。
+沿用参考实现的参数名 `mse_loss_weight`，实际只支持 cosine，不是 MSE。
+
+- `train.align_target='item'`：生成 SID 所用的原始文本 embedding。
+- `train.align_target='latent'`：同一个冻结 RQVAE 的 encoder 输出。
+- `train.align_target='quantized'`：该 RQVAE 各层选中码字向量之和，不含消歧后缀。
+- `train.align_item='current'`：对齐最后一个历史物品 b；`'next'`：对齐目标物品 s。原参考实现的 `pre` 在这里改名为 `current`。
+- 只支持 `train.mse_loss_mode='last'`、`train.align_loss_type='cos'`。输入 a1–a3、b1–b3，目标 s1–s3 时，SASRec/HSTU 取 b3 的最后一层 hidden；TIGER 取 decoder 起始 `pad` 的最后一层 hidden，即预测 s1 的位置，**不是 encoder hidden**。
+
+三类 target 在训练数据初始化时准备，按原始物品索引选择，不从可能碰撞的 SID 反查。目标不回传梯度；投影头结构为 `Linear → GELU → Linear(bias=False)`，参与优化并保存到带配置后缀的 checkpoint。评估和推理不使用对齐目标。
+
+例如运行 TIGER 的 quantized/current 对齐：
+
+```bash
+python -m trainers.general_trainer config/tiger.gin --split beauty \
+  --gin "train.align_target='quantized'" \
+  --gin "train.align_item='current'" \
+  --gin "train.mse_loss_weight=5" \
+  --gin "train.mse_loss_mode='last'" \
+  --gin "train.align_loss_type='cos'" \
+  --gin "train.save_dir_root='out/tiger/amazon/{split}/align_quantized_current_w5'" \
+  --gin "train.wandb_logging=False"
+```
+
+日志分别记录 `train/loss`、`train/ntp_loss`、未加权的 `train/align_loss`，对齐配置写入 `results.json`。不同配置应使用不同输出目录。手动加载启用对齐的检查点时，先调用 `configure_alignment(model, target_dim)` 注册同维度投影头，再加载模型权重。
+
+启用对齐时，checkpoint 和日志文件名均包含 target、方向、权重及模式，例如 `best_model_quantized_current_cos5_last.pt`、`tiger_quantized_current_cos5_last_20261016_120000.log`。关闭对齐时仍使用 `best_model.pt` 和原来的日志命名。
+
 ## 7. 输出文件
 
 | 模型 | Beauty 默认输出目录 |
@@ -185,6 +240,12 @@ iRea/
     general_trainer.py
     rqvae_trainer.py
     trainer_utils.py
+  scripts/
+    train.sh           # 单任务启动
+    train_grid.sh      # 9 个任务的 mytask 批量提交
+  tests/
+    test_kv_cache.py    # 缓存与完整前向的等价性测试
+    test_alignment.py  # 对齐来源、hidden 位置、梯度及训练流程
 ```
 
 查看命令行帮助，不会开始训练或下载数据：
@@ -194,6 +255,12 @@ python -m trainers.general_trainer --help
 python -m trainers.rqvae_trainer --help
 ```
 
-当前项目没有 `tests/` 目录，不提供失效的测试命令。推荐模型入口的帮助命令已验证可用；RQVAE 入口需要先解决上面的 W&B 导入问题。本文未启动真实数据训练，不包含未经验证的性能结果。
+运行 KV cache 和对齐回归测试，不需要检查点或下载数据；有可用 GPU 时额外验证缓存的 FP32/BF16：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+测试覆盖逐步 logits、生成序列与分数、左侧 padding、父 beam 复制重排、连续调用和训练反向传播。测试通过不等于已完成真实数据指标验证。
 
 本项目使用 MIT 许可证，详见 [LICENSE](LICENSE)。

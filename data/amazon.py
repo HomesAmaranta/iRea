@@ -293,9 +293,17 @@ class AmazonSeqDataset(Dataset):
         rqvae_hidden_dims: List[int] = [512, 256, 128, 64],
         rqvae_codebook_size: int = 256,
         rqvae_n_layers: int = 3,
+        align_target: Optional[str] = None,
+        align_item: str = "next",
     ) -> None:
         from models.rqvae import RqVae
 
+        if align_target not in (None, "item", "latent", "quantized"):
+            raise ValueError("align_target must be item, latent or quantized")
+        if align_item not in ("current", "next"):
+            raise ValueError("align_item must be current or next")
+        self.align_item = align_item
+        self.alignment_embeddings = None
         self.root = root
         self.split = split.lower()
         self.train_test_split = train_test_split
@@ -331,7 +339,15 @@ class AmazonSeqDataset(Dataset):
         rqvae.eval()
 
         with torch.no_grad():
-            self.sem_ids_list = rqvae.get_semantic_ids(self.item_embeddings).sem_ids.tolist()
+            quantized = rqvae.get_semantic_ids(self.item_embeddings)
+            self.sem_ids_list = quantized.sem_ids.tolist()
+            if align_target == "item":
+                self.alignment_embeddings = self.item_embeddings
+            elif align_target == "latent":
+                # The first residual is the encoder output before any quantization.
+                self.alignment_embeddings = quantized.residuals[..., 0].contiguous()
+            elif align_target == "quantized":
+                self.alignment_embeddings = quantized.embeddings.sum(dim=-1)
 
         # Add disambiguation suffix to handle collisions (optional)
         if self.add_disambiguation:
@@ -509,6 +525,12 @@ class AmazonSeqDataset(Dataset):
             item_ids=item_sem_ids,
             target_ids=target_sem_ids,
             timestamps=history_timestamps,
+            align_target_emb=(
+                self.alignment_embeddings[
+                    history_items[-1] if self.align_item == "current" else target_item
+                ]
+                if self.alignment_embeddings is not None else None
+            ),
         )
 
 

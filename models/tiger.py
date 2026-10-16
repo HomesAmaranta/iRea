@@ -86,10 +86,22 @@ class Tiger(SIDModelMixin, nn.Module):
         )
         return outputs.logits[:, -1, :], outputs.last_hidden_state[:, -1, :]
 
-    def generate(self, input_ids, attention_mask=None, num_beams=20, constrain_sid=False):
+    def _next_sid_token_cached(self, context, prefix, cache):
+        # The encoder output and cross-attention KV stay fixed during decoding.
+        decoder_ids = prefix.new_zeros((prefix.shape[0], 1)) if cache is None else prefix[:, -1:]
+        outputs = self.model(
+            encoder_outputs=(context[0],), attention_mask=context[1],
+            decoder_input_ids=decoder_ids, past_key_values=cache, use_cache=True,
+        )
+        return (outputs.logits[:, -1, :], outputs.last_hidden_state[:, -1, :],
+                outputs.past_key_values)
+
+    def generate(self, input_ids, attention_mask=None, num_beams=20, constrain_sid=False,
+                 use_cache=True):
         if isinstance(input_ids, dict):
             return SIDModelMixin.generate(
-                self, input_ids, num_beams=num_beams, constrain_sid=constrain_sid
+                self, input_ids, num_beams=num_beams, constrain_sid=constrain_sid,
+                use_cache=use_cache,
             )
         return self.model.generate(
             input_ids=input_ids,

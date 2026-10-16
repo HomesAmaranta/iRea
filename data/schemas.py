@@ -14,6 +14,7 @@ class SeqData(NamedTuple):
     item_ids: List[int]
     target_ids: List[int]
     timestamps: Optional[List[int]] = None  # One timestamp per history item, before SID expansion.
+    align_target_emb: Optional[Tensor] = None
 
 class SeqBatch(NamedTuple):
     """

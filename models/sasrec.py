@@ -86,28 +86,45 @@ class SASRec(SIDModelMixin, nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def _encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _encode(self, input_ids: torch.Tensor, cache=None, use_cache=False):
         """Encode input sequence into hidden representations [B, L, D]."""
         B, L = input_ids.shape
         device = input_ids.device
 
         mask = (input_ids != 0).unsqueeze(-1).float()
+        past_length = 0 if cache is None else cache[1].shape[1]
+        key_mask = mask if cache is None else torch.cat((cache[1], mask), dim=1)
         x = self.item_embedding(input_ids)
         if self.loss_type != "bce":
             x = x * (self.embed_dim ** 0.5)
 
-        positions = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+        positions = torch.arange(past_length, past_length + L, device=device).unsqueeze(0).expand(B, L)
         x = x + self.position_embedding(positions)
 
         x = self.emb_dropout(x)
         x = x * mask
 
-        for block in self.blocks:
-            x = block(x, mask)
+        present = []
+        for index, block in enumerate(self.blocks):
+            if use_cache:
+                past = None if cache is None else cache[0][index]
+                x, kv = block(x, mask, past_key_value=past, key_mask=key_mask, use_cache=True)
+                present.append(kv)
+            else:
+                x = block(x, mask)
             x = x * mask
 
         x = self.final_norm(x)
+        if use_cache:
+            return x, (tuple(present), key_mask)
         return x
+
+    def _next_sid_token_cached(self, context, prefix, cache):
+        # Prefill the history once, then only encode the newly selected token.
+        ids = context[0] if cache is None else prefix[:, -1:]
+        hidden, cache = self._encode(ids, cache=cache, use_cache=True)
+        hidden = hidden[:, -1, :]
+        return hidden @ self.item_embedding.weight.T, hidden, cache
 
     def forward(
         self,
@@ -182,7 +199,8 @@ class SASRecBlock(nn.Module):
         self.norm1 = nn.LayerNorm(embed_dim, eps=1e-8)
         self.norm2 = nn.LayerNorm(embed_dim, eps=1e-8)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, past_key_value=None,
+                key_mask=None, use_cache=False):
         """
         Args:
             x: Input tensor [B, L, D]
@@ -190,12 +208,18 @@ class SASRecBlock(nn.Module):
         """
         # Self-attention: normalize queries only (as in official impl)
         # Residual is added inside attention
-        x = self.attention(self.norm1(x), x, mask)
+        if use_cache:
+            x, present = self.attention(
+                self.norm1(x), x, mask, past_key_value=past_key_value,
+                full_key_mask=key_mask, use_cache=True,
+            )
+        else:
+            x = self.attention(self.norm1(x), x, mask)
 
         # Feed-forward with residual (added inside ffn)
         x = self.ffn(self.norm2(x), x)
 
-        return x
+        return (x, present) if use_cache else x
 
 
 class MultiHeadAttention(nn.Module):
@@ -227,7 +251,10 @@ class MultiHeadAttention(nn.Module):
         query: torch.Tensor,  # [B, L, D] - normalized
         key_value: torch.Tensor,  # [B, L, D] - not normalized (original x)
         mask: torch.Tensor,  # [B, L, 1]
-    ) -> torch.Tensor:
+        past_key_value=None,
+        full_key_mask=None,
+        use_cache=False,
+    ):
         B, L, _ = query.shape
 
         # Project Q from normalized input, K/V from original input
@@ -239,6 +266,11 @@ class MultiHeadAttention(nn.Module):
         Q = Q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        past_length = 0
+        if past_key_value is not None:
+            past_length = past_key_value[0].shape[2]
+            K = torch.cat((past_key_value[0], K), dim=2)
+            V = torch.cat((past_key_value[1], V), dim=2)
 
         # Attention scores: [B, H, L, L]
         scores = (Q @ K.transpose(-2, -1)) * self.scale
@@ -247,14 +279,17 @@ class MultiHeadAttention(nn.Module):
         # In official impl: key_masks = tf.sign(tf.reduce_sum(tf.abs(keys), axis=-1))
         # Since padding embeddings are zero, we use the mask directly
         # mask: [B, L, 1] -> key_mask: [B, 1, 1, L]
-        key_mask = mask.squeeze(-1).unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]
+        key_mask = (mask if full_key_mask is None else full_key_mask)
+        key_mask = key_mask.squeeze(-1).unsqueeze(1).unsqueeze(2)
 
         # Use large negative number instead of -inf (official uses -2^32+1)
         padding_value = -1e9
         scores = scores.masked_fill(key_mask == 0, padding_value)
 
         # Causal masking (future blinding)
-        causal_mask = torch.triu(torch.ones(L, L, device=scores.device), diagonal=1).bool()
+        causal_mask = torch.triu(
+            torch.ones(L, K.shape[2], device=scores.device), diagonal=past_length + 1
+        ).bool()
         scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), padding_value)
 
         # Softmax
@@ -276,7 +311,7 @@ class MultiHeadAttention(nn.Module):
         # Note: residual uses the normalized query, not original x
         out = out + query
 
-        return out
+        return (out, (K, V)) if use_cache else out
 
 
 class PointWiseFeedForward(nn.Module):
