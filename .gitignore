@@ -214,6 +214,7 @@ scripts/*
 !scripts/train.sh
 !scripts/train_lcrec.sh
 !scripts/train_onerec.sh
+!scripts/train_qwen3_grid.sh
 
 tests/
 
