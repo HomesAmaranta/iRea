@@ -1,9 +1,9 @@
 # iRea
 
-iRea 是 SID 生成式推荐实验代码，包含 TIGER、HSTU、SASRec、共享的 RQVAE，以及 OneRec 的独立 RQ-KMeans 训练入口。
+iRea 是 SID 生成式推荐实验代码，包含 TIGER、HSTU、SASRec、LCRec、OneRec，以及独立的 RQVAE 和 RQ-KMeans 训练入口。
 
 - RQVAE 独立训练，将物品文本 embedding 量化为语义 ID（SID）。
-- 三个推荐模型共用 `trainers.general_trainer`，数据加载、训练目标和评估流程一致。
+- TIGER/HSTU/SASRec 共用 `trainers.general_trainer`；LCRec/OneRec 共用独立的 `trainers.qwen3_trainer`，后者支持单卡和多进程训练。
 - 每个模型使用独立的 `config/模型名.gin`，不再设置配置子目录。
 
 ## 1. 环境准备
@@ -113,7 +113,55 @@ quantizer = RqKmeans.load("out/onerec/amazon/beauty/rqkmeans/rqkmeans.pt")
 sem_ids = quantizer.assign(embeddings).sem_ids  # [N, 3], each code in [0, 255]
 ```
 
-仅加载可信的 checkpoint，兼容格式包含 NumPy pickle 数据。此入口只补充 OneRec 的 RQ 训练，不包含 OneRec SFT，也不会自动将现有三个推荐模型的数据量化器切换为 RQ-KMeans；不要把 `rqkmeans.pt` 传给 `train.pretrained_rqvae_path`。现有 RQVAE 配置和训练流程不变。
+仅加载可信的 checkpoint，兼容格式包含 NumPy pickle 数据。此入口只负责 RQ 训练，OneRec SFT 使用下方的 `config/onerec.gin`。不会自动将现有三个推荐模型的数据量化器切换为 RQ-KMeans；不要把 `rqkmeans.pt` 传给 `train.pretrained_rqvae_path`。现有 RQVAE 配置和训练流程不变。
+
+### LCRec / OneRec 的 LLM 训练
+
+两者使用独立的 `trainers/qwen3_trainer.py`，参考 `NTR4GR/LC-Rec-backbone` 的 Qwen3 + LoRA 训练流程，不需要导入该项目或预先导出另一套交互数据。`config/onerec.gin` 继承 `config/lcrec.gin`，仅改变模型名称、SID 量化器和物品 embedding 来源：
+
+- LCRec：Sentence-T5-XL + 与 TIGER 相同的 RQVAE checkpoint，3 层 SID，无额外消歧码。
+- OneRec：Qwen3-Embedding-8B + `rqkmeans.pt`，3 层 SID；其余主干、prompt、LoRA、训练与评估参数与 LCRec 相同。这里的 OneRec 指 LCRec 主干的 RQ-KMeans SID 变体，不是额外移植另一套推荐网络。
+- 两者的推荐主干均为 `/opt/tiger/project/hf_models/Qwen3-0.6B`。不要把用于物品编码的 Qwen3-Embedding-8B 当作推荐主干。
+
+在 `iRea` 根目录运行；先完成对应的 RQVAE 或 RQ-KMeans 训练：
+
+```bash
+python -m trainers.qwen3_trainer config/lcrec.gin --split beauty
+python -m trainers.qwen3_trainer config/onerec.gin --split beauty
+
+# 四卡脚本入口（上面的普通 python 命令是单进程，不会自动启动四卡）
+bash scripts/train_lcrec.sh beauty   # 脚本内指定 GPU 0,1,2,3
+bash scripts/train_onerec.sh beauty  # 脚本内指定 GPU 4,5,6,7
+
+# 通用入口的 lcrec/onerec 分支也会转到对应的四卡脚本
+bash scripts/train.sh lcrec beauty
+bash scripts/train.sh onerec beauty
+
+# 等价四卡命令；每张卡持有完整基础模型及一份独立的最优模型副本
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  -m trainers.qwen3_trainer config/lcrec.gin --split beauty
+```
+
+GPU 编号直接写在各脚本的 `export CUDA_VISIBLE_DEVICES` 中：LCRec 为 `0,1,2,3`，OneRec 为 `4,5,6,7`，不继承外部 GPU 设置；换卡时直接修改该行。可见 GPU 数不是 4 时会报错退出。类别默认 `beauty`，后续 `--gin` 参数原样传给 trainer，`PYTHON` 可指定解释器路径。两个任务同时运行时应指定不同的 GPU 组及输出目录；`--standalone` 自动选择通信端口，不共用固定端口。
+
+新 trainer 的参数前缀是 **`train_lcrec.`**，不是 `train.`。例如：
+
+```bash
+python -m trainers.qwen3_trainer config/lcrec.gin --split toys \
+  --gin "train_lcrec.base_model='/opt/tiger/project/hf_models/Qwen3-1.7B'" \
+  --gin "train_lcrec.batch_size=8" \
+  --gin "train_lcrec.gradient_accumulate_every=16"
+```
+
+默认 LoRA rank=8、alpha=32、dropout=0.05，训练 `q_proj,v_proj,o_proj,up_proj,down_proj`，同时训练并保存 `embed_tokens,lm_head`。采用 AdamW、lr=`1e-3`、cosine scheduler、200 warmup steps、BF16、梯度检查点、每卡 microbatch=16、梯度累积=8；有效 batch 为 `16 * 8 * GPU 数量`，默认四卡为 512。无 BF16 环境可追加 `--gin "train_lcrec.mixed_precision='no'"`。
+
+数据直接复用 Amazon 的滑窗和 leave-one-out 划分，同一次运行只量化一次物品。历史最大 20 个物品，prompt 为 `What would user be likely to purchase next after buying items {history} ?|start_of_answer|`，SID 注册为 `<a_0><b_1><c_2>` 形式的独立 token。训练只监督目标 SID 和 EOS，不监督 prompt/padding；长度超限只删除完整的最早历史物品，不截断目标。推理只传历史 prompt，默认使用真实 SID 目录的前缀约束 beam search；`constrain_sid=False` 则仅约束每层码本，不约束目录中的组合。
+
+默认最多训练 10 个 epoch，每个 epoch 验证一次，连续 2 次验证 CE 无严格降低则早停。CE 包含目标 SID 与 EOS、排除辅助对齐损失；`--gin "train_lcrec.early_stop_metric='hr'"` 切回 Recall@最大 K。仅在验证指标刷新最优时，用 `copy.deepcopy` 保留的内存最优模型测试一次；验证无改善不测试，训练结束也不再测试、不从磁盘重载。最终结果复用最后一次验证刷新最优时的测试指标，测试表现不参与选模或早停。SID 碰撞不会自动消歧，Recall/NDCG 与现有三个模型一样按完整 SID 匹配，不是唯一 ItemID 匹配。
+
+辅助对齐默认关闭，通过 `train_lcrec.mse_loss_weight` 开启。`align_target` 支持 `item/quantized`，LCRec 额外支持 `latent`；`align_item` 支持 `current/next`。`align_source` 支持 `last_inp`（答案分隔符前一位置）、`last_out`（分隔符位置）、`mean_out`（预测 SID 各 token 的位置均值），损失支持 `cos/gram`；Gram 在本卡 microbatch 内计算。默认与参考一样为 `quantized/current/last_inp/cos`。
+
+输出到 `out/lcrec/amazon/<split>/sft/` 或 `out/onerec/amazon/<split>/sft/`，启用对齐会追加配置后缀。`best_model/` 保存 LoRA adapter、可训练 embedding/output head 和 tokenizer，启用 cosine 对齐时另存 `alignment.pt`；基础模型仍从 `base_model` 加载。目录另有 `sid_catalogue.json`、`run_config.json`、`results.json` 和日志，结果中的 `extra` 记录最优轮次及验证值。当前入口是从基础模型开始训练，不包含优化器断点续训接口。
 
 ## 4. 选择推荐模型运行
 
@@ -251,8 +299,10 @@ python -m trainers.general_trainer config/tiger.gin --split beauty \
 | TIGER | `out/tiger/amazon/beauty/` |
 | HSTU | `out/hstu/amazon/beauty/sid/` |
 | SASRec | `out/sasrec/amazon/beauty/sid/` |
+| LCRec | `out/lcrec/amazon/beauty/sft/` |
+| OneRec | `out/onerec/amazon/beauty/sft/` |
 
-推荐模型目录中包含 `best_model.pt`、`results.json` 和训练日志。三个推荐模型默认按验证集 CE 最低值选最佳模型，连续 10 次验证无严格改善则早停。CE 验证使用 teacher forcing，只计算目标 SID 的平均交叉熵，不包含 alignment loss，不运行 beam search。追加 `--gin "train.early_stop_metric='hr'"` 可切回验证集 `Recall@max(top_ks)`（默认 `Recall@10`）最高值选模；每个样本只有一个目标 SID，因此此处 HR 与 Recall 相同。
+TIGER/HSTU/SASRec 目录中包含 `best_model.pt`、`results.json` 和训练日志。三个推荐模型默认按验证集 CE 最低值选最佳模型，连续 10 次验证无严格改善则早停。CE 验证使用 teacher forcing，只计算目标 SID 的平均交叉熵，不包含 alignment loss，不运行 beam search。追加 `--gin "train.early_stop_metric='hr'"` 可切回验证集 `Recall@max(top_ks)`（默认 `Recall@10`）最高值选模；每个样本只有一个目标 SID，因此此处 HR 与 Recall 相同。LCRec/OneRec 的 adapter 输出格式及参数前缀见上节。
 
 训练期间不评估测试集。验证指标刷新最优时，通过 `best_model = copy.deepcopy(model).eval()` 保留独立的完整模型副本，设备与训练模型相同，因此会额外占用一份模型的内存或显存。训练结束直接使用 `best_model`，仅计算一次测试集 Recall/NDCG，不再从磁盘加载。仍保存 `best_model.pt` 权重文件供后续使用。`results.json` 记录 `early_stop_metric`、`best_valid_metric`、`best_valid_value`；未计算的 `best_valid_ce` 或 `best_valid_recall` 为 `null`。`best_model.pt` 只保存模型权重，当前 `general_trainer` 没有独立的断点续训或仅评估命令行入口。
 
@@ -267,16 +317,21 @@ iRea/
     tiger.gin
     hstu.gin
     sasrec.gin
+    lcrec.gin          # Qwen3 + LoRA，复用 TIGER SID
+    onerec.gin         # 继承 LCRec，仅更换 SID 配方
   data/                # 数据加载、滑窗样本和 SID batch
-  models/              # 四个模型及 SID 公共接口
+  models/              # 推荐模型、量化器及 SID 公共接口
   modules/             # 公共组件
   trainers/
     general_trainer.py
     rqvae_trainer.py
     rqkmeans_trainer.py
+    qwen3_trainer.py
     trainer_utils.py
   scripts/
     train.sh           # 单任务启动
+    train_lcrec.sh     # LCRec 四卡训练
+    train_onerec.sh    # OneRec 四卡训练
     train_grid.sh      # 9 个任务的 mytask 批量提交
   tests/
     test_kv_cache.py    # 缓存与完整前向的等价性测试
@@ -289,6 +344,7 @@ iRea/
 python -m trainers.general_trainer --help
 python -m trainers.rqvae_trainer --help
 python -m trainers.rqkmeans_trainer --help
+python -m trainers.qwen3_trainer --help
 ```
 
 运行 KV cache 和对齐回归测试，不需要检查点或下载数据；有可用 GPU 时额外验证缓存的 FP32/BF16：

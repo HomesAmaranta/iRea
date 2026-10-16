@@ -1,0 +1,7 @@
+# Same Qwen3, LoRA, prompt, samples and trainer as LCRec; only the SID recipe changes.
+include "config/lcrec.gin"
+
+train_lcrec.model_name = "onerec"
+train_lcrec.quantizer = "rqkmeans"
+train_lcrec.encoder_model_name = %MODEL_HUB_QWEN3_EMBEDDING_8B
+train_lcrec.pretrained_rqkmeans_path = "out/onerec/amazon/{split}/rqkmeans/rqkmeans.pt"

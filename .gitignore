@@ -210,7 +210,10 @@ assets/
 reference/
 GRLM/
 
-scripts/
+scripts/*
+!scripts/train.sh
+!scripts/train_lcrec.sh
+!scripts/train_onerec.sh
 
 tests/
 

@@ -1,0 +1,51 @@
+# Qwen3 + LoRA with exactly the same Sentence-T5 / RQVAE SIDs as TIGER.
+include "config/base.gin"
+
+train_lcrec.model_name = "lcrec"
+train_lcrec.quantizer = "rqvae"
+train_lcrec.base_model = %MODEL_HUB_QWEN3_06B
+train_lcrec.encoder_model_name = %MODEL_HUB_SENTENCE_T5_XL
+train_lcrec.dataset_folder = "dataset/amazon"
+train_lcrec.pretrained_rqvae_path = "out/tiger/amazon/{split}/rqvae/checkpoint_epoch_4999.pt"
+train_lcrec.rqvae_config = {
+    "rqvae_input_dim": 768,
+    "rqvae_embed_dim": 32,
+    "rqvae_hidden_dims": [512, 256, 128, 64],
+}
+train_lcrec.save_dir_root = "out/{model}/amazon/{split}/sft"
+train_lcrec.codebook_size = 256
+train_lcrec.sem_id_dim = 3
+train_lcrec.max_seq_len = 20
+train_lcrec.model_max_length = 512
+train_lcrec.prompt_template = "What would user be likely to purchase next after buying items {history} ?"
+
+train_lcrec.epochs = 10
+# Per-device batches; effective batch = batch_size * accumulation * world_size.
+train_lcrec.batch_size = 16
+train_lcrec.infer_batch_size = 8
+train_lcrec.gradient_accumulate_every = 8
+train_lcrec.learning_rate = 1e-3
+train_lcrec.weight_decay = 0.0
+train_lcrec.lr_schedule = "cosine"
+train_lcrec.num_warmup_steps = 200
+train_lcrec.max_grad_norm = 10.0
+train_lcrec.lora_r = 8
+train_lcrec.lora_alpha = 32
+train_lcrec.lora_dropout = 0.05
+train_lcrec.lora_target_modules = ["q_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
+train_lcrec.gradient_checkpointing = True
+train_lcrec.mixed_precision = "bf16"
+train_lcrec.early_stop_metric = "ce"
+train_lcrec.early_stop_patience = 2
+train_lcrec.eval_valid_every_n_epochs = 1
+train_lcrec.beam_size = 30
+train_lcrec.top_ks = [5, 10]
+train_lcrec.constrain_sid = True
+train_lcrec.seed = 42
+
+train_lcrec.mse_loss_weight = 0.0
+train_lcrec.align_target = "quantized"
+train_lcrec.align_item = "current"
+train_lcrec.align_source = "last_inp"
+train_lcrec.align_loss_type = "cos"
+train_lcrec.wandb_logging = False

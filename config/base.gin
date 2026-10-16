@@ -17,3 +17,6 @@ MODEL_HUB_SENTENCE_T5_XL = "/opt/tiger/project/hf_models/sentence-t5-xl"
 
 # OneRec RQ-KMeans item encoder
 MODEL_HUB_QWEN3_EMBEDDING_8B = "/opt/tiger/project/hf_models/Qwen3-Embedding-8B"
+
+# LCRec / OneRec recommendation backbone (not the item encoder).
+MODEL_HUB_QWEN3_06B = "/opt/tiger/project/hf_models/Qwen3-0.6B"
