@@ -9,7 +9,7 @@ mse_loss_weights=(5)
 align_items=(current)
 align_sources=(last_inp)
 learning_rates=(5e-4)
-align_loss_types=(cos gram cosgram) # cosgram: 0.5*cos + 0.5*gram
+align_loss_types=(cos gram cosgram) # gram: Linear(d,d); cosgram: 0.5*cos + 0.5*gram
 gpu_ids="0,1,2,3"
 
 # Pass the four visible GPUs above to each model's bash launcher.
@@ -89,7 +89,11 @@ for model in "${models[@]}"; do
                 if [[ -n "${seen[$key]:-}" ]]; then continue; fi
                 seen[$key]=1
                 # The trainer appends its alignment suffix; only add the LR here.
-                save_dir="out/${model}/amazon/${dataset}/sft_lr${lr}"
+                output_root=out
+                if [[ "$weight" != 0 && "$align_loss_type" != cos ]]; then
+                  output_root=out_lineargram
+                fi
+                save_dir="${output_root}/${model}/amazon/${dataset}/sft_lr${lr}"
                 cmd=(
                   bash "./scripts/train_${model}.sh" "$dataset"
                   --gpus "$gpu_ids"

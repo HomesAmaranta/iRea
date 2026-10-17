@@ -31,12 +31,15 @@ class LCRec(nn.Module):
         self.sem_id_dim = sid_token_ids.shape[0]
         self.eos_token_id, self.pad_token_id = eos_token_id, pad_token_id
         self.align_source, self.align_loss_type = align_source, align_loss_type
-        if align_dim is not None and align_loss_type in ("cos", "cosgram"):
+        if align_dim is not None:
             hidden_dim = backbone.config.hidden_size
-            self.hidden_to_item_emb = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-                nn.Linear(hidden_dim, align_dim, bias=False),
-            )
+            if align_loss_type in ("cos", "cosgram"):
+                self.hidden_to_item_emb = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+                    nn.Linear(hidden_dim, align_dim, bias=False),
+                )
+            if align_loss_type in ("gram", "cosgram"):
+                self.hidden_to_gram = nn.Linear(hidden_dim, hidden_dim)
         self.has_alignment = align_dim is not None
         self.prefix_tokens = {}
         for sid in catalogue_sids:
@@ -88,10 +91,13 @@ class LCRec(nn.Module):
             if target.ndim != 2 or target.shape[0] != len(targets) or not torch.isfinite(target).all():
                 raise ValueError("Alignment requires finite vectors, one per sample")
             if self.align_loss_type in ("gram", "cosgram"):
+                prediction = self.hidden_to_gram(selected.float()).float()
                 with torch.autocast(device_type=selected.device.type, enabled=False):
-                    prediction = F.normalize(selected.float(), dim=-1)
+                    normalized_prediction = F.normalize(prediction, dim=-1)
                     reference = F.normalize(target, dim=-1)
-                    gram_loss = F.mse_loss(prediction @ prediction.T, reference @ reference.T)
+                    gram_loss = F.mse_loss(
+                        normalized_prediction @ normalized_prediction.T, reference @ reference.T
+                    )
                 align_loss = gram_loss
             if self.align_loss_type in ("cos", "cosgram"):
                 prediction = self.hidden_to_item_emb(selected.float()).float()
@@ -135,6 +141,8 @@ class LCRec(nn.Module):
         tokenizer.save_pretrained(path)
         if hasattr(self, "hidden_to_item_emb"):
             torch.save(self.hidden_to_item_emb.state_dict(), os.path.join(path, "alignment.pt"))
+        if hasattr(self, "hidden_to_gram"):
+            torch.save(self.hidden_to_gram.state_dict(), os.path.join(path, "gram_alignment.pt"))
 
 
 def build_lcrec(base_model, tokenizer, sid_token_ids, catalogue_sids, mixed_precision="bf16",

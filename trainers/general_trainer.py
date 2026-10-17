@@ -30,18 +30,25 @@ def move_batch(batch, device, include_labels=True):
     }
 
 
-def configure_alignment(model, target_dim):
-    """Register the reference MLP before creating the optimizer/checkpoint."""
+def configure_alignment(model, target_dim, align_loss_type="cos"):
+    """Register only the required heads before creating the optimizer/checkpoint."""
+    if align_loss_type not in ("cos", "gram", "cosgram"):
+        raise ValueError("align_loss_type must be cos, gram or cosgram")
     if target_dim <= 0:
         raise ValueError("Alignment target dimension must be positive")
     embedding = (model.model.get_input_embeddings() if hasattr(model, "model")
                  else model.item_embedding)
     hidden_dim = embedding.weight.shape[1]
-    model.hidden_to_item_emb = nn.Sequential(
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.GELU(),
-        nn.Linear(hidden_dim, target_dim, bias=False),
-    ).to(device=embedding.weight.device, dtype=embedding.weight.dtype)
+    if align_loss_type in ("cos", "cosgram"):
+        model.hidden_to_item_emb = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, target_dim, bias=False),
+        ).to(device=embedding.weight.device, dtype=embedding.weight.dtype)
+    if align_loss_type in ("gram", "cosgram"):
+        model.hidden_to_gram = nn.Linear(hidden_dim, hidden_dim).to(
+            device=embedding.weight.device, dtype=embedding.weight.dtype
+        )
 
 
 def compute_alignment_loss(model, output, inp, align_loss_type="cos"):
@@ -53,15 +60,17 @@ def compute_alignment_loss(model, output, inp, align_loss_type="cos"):
     target = inp.get("align_target_emb")
     if target is None:
         raise ValueError("Alignment requires align_target_emb")
+    if target.ndim != 2 or target.shape[0] != hidden.shape[0]:
+        raise ValueError("Alignment requires one target vector per sample")
     if align_loss_type in ("gram", "cosgram"):
-        if target.ndim != 2 or target.shape[0] != hidden.shape[0]:
-            raise ValueError("Gram alignment requires one target vector per sample")
-        # Batch-wise cosine Gram matrices allow different hidden/target dimensions.
+        # Gram compares sample similarities, so target feature dimensions may differ.
+        prediction = model.hidden_to_gram(hidden)
         with torch.autocast(device_type=hidden.device.type, enabled=False):
-            prediction = F.normalize(hidden.float(), dim=-1, eps=1e-8)
+            normalized_prediction = F.normalize(prediction.float(), dim=-1, eps=1e-8)
             reference = F.normalize(target.detach().float(), dim=-1, eps=1e-8)
             gram_loss = F.mse_loss(
-                prediction @ prediction.T, reference @ reference.T, reduction="mean"
+                normalized_prediction @ normalized_prediction.T,
+                reference @ reference.T, reduction="mean"
             )
         if align_loss_type == "gram":
             return gram_loss
@@ -281,8 +290,7 @@ def train(
         target = getattr(datasets["train"][0], "align_target_emb", None)
         if target is None or torch.as_tensor(target).ndim != 1:
             raise ValueError("Training dataset must provide an align_target_emb vector")
-        if align_loss_type in ("cos", "cosgram"):
-            configure_alignment(model, len(target))
+        configure_alignment(model, len(target), align_loss_type)
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = None
     if lr_schedule == "cosine":

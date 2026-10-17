@@ -219,3 +219,4 @@ scripts/*
 tests/
 
 .dbg/
+out_*/

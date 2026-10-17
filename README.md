@@ -158,9 +158,11 @@ python -m trainers.qwen3_trainer config/lcrec.gin --split toys \
 
 默认最多训练 10 个 epoch，每个 epoch 验证一次，连续 2 次验证 CE 无严格降低则早停。验证 CE 只包含目标 SID，排除 EOS 和辅助对齐损失；`--gin "train_lcrec.early_stop_metric='hr'"` 切回 Recall@最大 K。仅在验证指标刷新最优时，用 `copy.deepcopy` 保留的内存最优模型测试一次；验证无改善不测试，训练结束也不再测试、不从磁盘重载。最终结果复用最后一次验证刷新最优时的测试指标，测试表现不参与选模或早停。SID 碰撞不会自动消歧，Recall/NDCG 与现有三个模型一样按完整 SID 匹配，不是唯一 ItemID 匹配。
 
-辅助对齐默认关闭，通过 `train_lcrec.mse_loss_weight` 开启。`align_target` 支持 `item/quantized`，LCRec 额外支持 `latent`；`align_item` 支持 `current/next`。`align_source` 支持 `last_inp`（答案分隔符前一位置）、`last_out`（分隔符位置）、`mean_out`（预测 SID 各 token 的位置均值），损失支持 `cos/gram`；Gram 在本卡 microbatch 内计算。默认与参考一样为 `quantized/current/last_inp/cos`。
+辅助对齐默认关闭，通过 `train_lcrec.mse_loss_weight` 开启。`align_target` 支持 `item/quantized`，LCRec 额外支持 `latent`；`align_item` 支持 `current/next`。`align_source` 支持 `last_inp`（答案分隔符前一位置）、`last_out`（分隔符位置）、`mean_out`（预测 SID 各 token 的位置均值），损失支持 `cos/gram/cosgram`。cos 保留 `Linear → GELU → Linear` MLP，将 hidden 映射到目标维度；Gram 仅使用一层带 bias 的 `Linear(hidden_dim, hidden_dim)`，维度不变、无激活函数。Gram 对线性映射后的表示归一化，在本卡 microbatch 内计算余弦相似度矩阵的 MSE，目标向量维度无需与 hidden 相同。`cosgram` 使用独立的 MLP 和 Linear 分支，仍取 `0.5*cos + 0.5*gram`；纯 gram 不创建 MLP。默认与参考一样为 `quantized/current/last_inp/cos`。
 
-输出到 `out/lcrec/amazon/<split>/sft/` 或 `out/onerec/amazon/<split>/sft/`，启用对齐会追加配置后缀。`best_model/` 保存 LoRA adapter、可训练 embedding/output head 和 tokenizer，启用 cosine 对齐时另存 `alignment.pt`；基础模型仍从 `base_model` 加载。目录另有 `sid_catalogue.json`、`run_config.json`、`results.json` 和日志，结果中的 `extra` 记录最优轮次及验证值。当前入口是从基础模型开始训练，不包含优化器断点续训接口。
+TIGER/SASRec/HSTU 的 `train.align_loss_type` 同样使用上述损失。Gram 先后有原始 hidden、MLP、等维 Linear 三种实现，不可视为同一实验配置；分别保留在 `out`、`out_mlpgram`、`out_lineargram`。当前 `scripts/train_grid.sh` 输出到 `out_lineargram`；Qwen 网格的 gram/cosgram 也使用该目录，cos/base 保持原目录。`out/extract_results.py` 自动读取存在的三个目录，在原页签中分区并列显示。旧 hidden/MLP Gram checkpoint 缺少新 Linear 头，不能直接作为新 Gram 对齐训练的完整 checkpoint 加载。
+
+输出到 `out/lcrec/amazon/<split>/sft/` 或 `out/onerec/amazon/<split>/sft/`，启用对齐会追加配置后缀。`best_model/` 保存 LoRA adapter、可训练 embedding/output head 和 tokenizer，启用 cos 分支时另存 `alignment.pt`，启用 gram 分支时另存 `gram_alignment.pt`，cosgram 保存两个头；基础模型仍从 `base_model` 加载。目录另有 `sid_catalogue.json`、`run_config.json`、`results.json` 和日志，结果中的 `extra` 记录最优轮次及验证值。当前入口是从基础模型开始训练，不包含优化器断点续训接口。
 
 ## 4. 选择推荐模型运行
 
