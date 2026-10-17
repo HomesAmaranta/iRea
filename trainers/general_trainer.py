@@ -46,7 +46,7 @@ def configure_alignment(model, target_dim, align_loss_type="cos"):
             nn.Linear(hidden_dim, target_dim, bias=False),
         ).to(device=embedding.weight.device, dtype=embedding.weight.dtype)
     if align_loss_type in ("gram", "cosgram"):
-        model.hidden_to_gram = nn.Linear(hidden_dim, hidden_dim).to(
+        model.hidden_to_gram = nn.Linear(hidden_dim, hidden_dim, bias=False).to(
             device=embedding.weight.device, dtype=embedding.weight.dtype
         )
 

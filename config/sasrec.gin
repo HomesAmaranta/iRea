@@ -13,10 +13,10 @@ train.batch_size = 128
 train.learning_rate = 1e-3
 train.weight_decay = 0.0
 
-# Decoder-only backbone: one causal attention + FFN per block, no context stack.
-# Pre-RMSNorm per sublayer, final RMSNorm/dropout once after the full stack.
-# First-block relative position bias and a scaled tied output head.
-# The SID interface always uses NTP cross-entropy. Old backbone weights are incompatible.
+# Reference SASRec: absolute positions, query-only LayerNorm, residual ReLU FFN.
+# Q/K/V have bias, scores use sqrt(head_dim) scaling; tied logits are unscaled.
+# Keep the existing sizes and training settings; SID uses target-only NTP CE.
+# d_kv and feed_forward_proj are validated compatibility options (32 and relu).
 train.max_seq_len = 20
 train.embed_dim = 128
 train.num_heads = 4

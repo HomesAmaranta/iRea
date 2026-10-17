@@ -158,7 +158,7 @@ python -m trainers.qwen3_trainer config/lcrec.gin --split toys \
 
 默认最多训练 10 个 epoch，每个 epoch 验证一次，连续 2 次验证 CE 无严格降低则早停。验证 CE 只包含目标 SID，排除 EOS 和辅助对齐损失；`--gin "train_lcrec.early_stop_metric='hr'"` 切回 Recall@最大 K。仅在验证指标刷新最优时，用 `copy.deepcopy` 保留的内存最优模型测试一次；验证无改善不测试，训练结束也不再测试、不从磁盘重载。最终结果复用最后一次验证刷新最优时的测试指标，测试表现不参与选模或早停。SID 碰撞不会自动消歧，Recall/NDCG 与现有三个模型一样按完整 SID 匹配，不是唯一 ItemID 匹配。
 
-辅助对齐默认关闭，通过 `train_lcrec.mse_loss_weight` 开启。`align_target` 支持 `item/quantized`，LCRec 额外支持 `latent`；`align_item` 支持 `current/next`。`align_source` 支持 `last_inp`（答案分隔符前一位置）、`last_out`（分隔符位置）、`mean_out`（预测 SID 各 token 的位置均值），损失支持 `cos/gram/cosgram`。cos 保留 `Linear → GELU → Linear` MLP，将 hidden 映射到目标维度；Gram 仅使用一层带 bias 的 `Linear(hidden_dim, hidden_dim)`，维度不变、无激活函数。Gram 对线性映射后的表示归一化，在本卡 microbatch 内计算余弦相似度矩阵的 MSE，目标向量维度无需与 hidden 相同。`cosgram` 使用独立的 MLP 和 Linear 分支，仍取 `0.5*cos + 0.5*gram`；纯 gram 不创建 MLP。默认与参考一样为 `quantized/current/last_inp/cos`。
+辅助对齐默认关闭，通过 `train_lcrec.mse_loss_weight` 开启。`align_target` 支持 `item/quantized`，LCRec 额外支持 `latent`；`align_item` 支持 `current/next`。`align_source` 支持 `last_inp`（答案分隔符前一位置）、`last_out`（分隔符位置）、`mean_out`（预测 SID 各 token 的位置均值），损失支持 `cos/gram/cosgram`。cos 保留 `Linear → GELU → Linear` MLP，将 hidden 映射到目标维度；Gram 仅使用一层无 bias 的 `Linear(hidden_dim, hidden_dim, bias=False)`，维度不变、无激活函数。Gram 对线性映射后的表示归一化，在本卡 microbatch 内计算余弦相似度矩阵的 MSE，目标向量维度无需与 hidden 相同。`cosgram` 使用独立的 MLP 和 Linear 分支，仍取 `0.5*cos + 0.5*gram`；纯 gram 不创建 MLP。此前带 bias 的 Linear 实验需与当前版本分开记录，旧 checkpoint 含额外 bias 参数，不能直接严格加载。默认与参考一样为 `quantized/current/last_inp/cos`。
 
 TIGER/SASRec/HSTU 的 `train.align_loss_type` 同样使用上述损失。Gram 先后有原始 hidden、MLP、等维 Linear 三种实现，不可视为同一实验配置；分别保留在 `out`、`out_mlpgram`、`out_lineargram`。当前 `scripts/train_grid.sh` 输出到 `out_lineargram`；Qwen 网格的 gram/cosgram 也使用该目录，cos/base 保持原目录。`out/extract_results.py` 自动读取存在的三个目录，在原页签中分区并列显示。旧 hidden/MLP Gram checkpoint 缺少新 Linear 头，不能直接作为新 Gram 对齐训练的完整 checkpoint 加载。
 
@@ -245,7 +245,7 @@ CUDA_VISIBLE_DEVICES=0 python -m trainers.general_trainer config/hstu.gin \
 - **编码**：各层 SID 使用独立 offset，padding 为 0。默认 SID 长度为 3，当前配置不添加消歧后缀。
 - **目标**：三个推荐模型都使用 teacher forcing 和目标 SID 上的 NTP 交叉熵，不计算历史 token 的 loss，不使用 BCE 或负采样。
 - **模型**：TIGER 保留 T5 encoder-decoder；HSTU 保留原骨干和不缩放的 SID embedding 输出头。
-- **SASRec 主干**：仅保留 Decoder 堆叠，无 Context、无交叉注意力。`train.num_blocks` 是 Decoder block 数，每个 block 为 1 个因果自注意力 + 1 个 FFN。Q/K/V 均来自 RMSNorm 后的输入，Q/K/V/O 投影无 bias，注意力分数不除以 `sqrt(d_kv)`；仅首个 block 使用分桶相对位置 bias，不使用绝对位置 embedding。每个 block 后执行共享的 RMSNorm + Dropout，输出头为 `(hidden / sqrt(embed_dim)) @ embedding.T`。`train.d_kv` 控制每个 head 的维度，`train.feed_forward_proj` 默认 `"relu"`，也支持 `"gated-gelu"`。旧 SASRec 主干 checkpoint 不能直接加载，需要重新训练。
+- **SASRec 主干**：恢复为 `genrec/genrec/models/sasrec.py` 的结构，保留 `hidden=128`、`FFN=512`、4 个 block、4 个 head、dropout=0.1。使用绝对位置 embedding、`padding_idx=0` 和 Xavier 初始化；CE 模式的输入 embedding 乘 `sqrt(embed_dim)`。每个 block 的 Q 来自 LayerNorm 后输入，K/V 来自原输入，Q/K/V 带 bias、无 O 投影，分数除以 `sqrt(head_dim)`，注意力残差使用归一化后的 Q 输入。FFN 为带 bias 的 ReLU 两层映射，残差使用 FFN 前的原输入。softmax 后屏蔽 padding query，输入和每个 block 后清零 padding；末尾只执行一次 `LayerNorm(eps=1e-8)`，输出为 `hidden @ embedding.T`。`train.d_kv` 仅兼容 `embed_dim/num_heads`，`train.feed_forward_proj` 仅支持 `"relu"`。SID 接口和目标 NTP CE 不变，20 个历史物品、3 层 SID 对应 62 个位置（含目标前缀）。此前 RMSNorm/相对位置版本 checkpoint 不能直接加载，重跑需使用独立输出目录，避免与 SASRec2 旧结果混合。
 - **HSTU 位置偏置**：不使用时间戳；距离为 `query位置 − key位置`。query=2 对 keys `[0, 1, 2, 3]` 的位置桶为 `[2, 1, 0, 0]`，未来 key=3 仍被因果掩码屏蔽。
 - **推理**：逐 token 自回归 beam search，固定生成一个完整 SID，不读取目标 label。默认不使用物品前缀树约束；`constrain_sid=True` 也只是按码本层限制词表，不保证生成结果对应真实物品。
 - **评估**：按完整 SID 匹配计算 Recall、NDCG，不是原始 item ID 的全物品打分。不同物品 SID 相同时无法区分，结果需结合 RQVAE 碰撞率解读。
@@ -254,7 +254,7 @@ CUDA_VISIBLE_DEVICES=0 python -m trainers.general_trainer config/hstu.gin \
 
 SASRec 和 TIGER 在 `eval()` 模式的 SID 生成中默认启用 KV cache，启动命令不用改：
 
-- SASRec 首步计算历史并缓存每层 K/V，之后只输入新生成的一个 token，因果 mask 和相对位置 bias 的 query 偏移延续历史长度。
+- SASRec 首步计算历史并缓存每层原输入投影得到的 K/V，之后只输入新生成的一个 token；绝对位置索引和因果 mask 的 query 偏移延续完整历史长度（包括左侧 padding），不从零重新编号。
 - TIGER 的 encoder 只计算一次，decoder 缓存 self-attention 和 cross-attention K/V，之后只输入新增 token。
 - beam search 每步选择父 beam 后会同步复制、重排缓存；缓存仅属于本次调用，不写入检查点。
 - HSTU 仍使用完整前缀重算；训练前向不使用缓存。BF16 下缓存与重算可能有小幅浮点差异，接近同分的 beam 顺序可能变化。

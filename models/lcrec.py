@@ -39,7 +39,7 @@ class LCRec(nn.Module):
                     nn.Linear(hidden_dim, align_dim, bias=False),
                 )
             if align_loss_type in ("gram", "cosgram"):
-                self.hidden_to_gram = nn.Linear(hidden_dim, hidden_dim)
+                self.hidden_to_gram = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.has_alignment = align_dim is not None
         self.prefix_tokens = {}
         for sid in catalogue_sids:
