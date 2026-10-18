@@ -4,7 +4,7 @@ import torch
 
 
 def sid_collate(batch, codebook_size=256, sem_id_dim=3, max_seq_len=20,
-                require_timestamps=False):
+                require_timestamps=False, fusion=False):
     if not batch or min(codebook_size, sem_id_dim, max_seq_len) <= 0:
         raise ValueError("A nonempty batch and positive SID dimensions are required")
     max_tokens = max_seq_len * sem_id_dim
@@ -47,11 +47,14 @@ def sid_collate(batch, codebook_size=256, sem_id_dim=3, max_seq_len=20,
     if timestamps is not None:
         inp["timestamps"] = timestamps
     targets = [getattr(sample, "align_target_emb", None) for sample in batch]
+    if fusion and any(target is None for target in targets):
+        raise ValueError("Fusion requires current-item embeddings for every sample")
     if any(target is not None for target in targets):
         if any(target is None for target in targets):
             raise ValueError("Alignment targets are missing from the SID batch")
         targets = torch.stack([torch.as_tensor(target, dtype=torch.float32) for target in targets])
         if targets.ndim != 2 or targets.shape[1] == 0 or not torch.isfinite(targets).all():
             raise ValueError("Alignment targets must be finite vectors")
-        inp["align_target_emb"] = targets
+        # Fusion features are available at inference, unlike next-item alignment targets.
+        inp["fusion_emb" if fusion else "align_target_emb"] = targets
     return inp

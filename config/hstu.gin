@@ -23,6 +23,14 @@ train.num_position_buckets = 32
 train.num_time_buckets = 64
 train.use_temporal_bias = False
 
+# Optional current-item fusion at the fixed last-history SID token.
+train.fusion_mode = "none"  # none | add | concat
+train.fusion_position = "out"  # out | attn (final-layer K/V only)
+
+# NITP: detached next-token block output, one-based layer index.
+train.nitp_weight = 0.0
+train.nitp_target_layer = 1  # try 1 | 2 | 3 independently
+
 # Shared TIGER sliding-window SID data; timestamps are not used by this model.
 train.dataset = @AmazonSeqDataset
 train.dataset_folder = "dataset/amazon"

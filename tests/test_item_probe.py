@@ -555,6 +555,49 @@ class ProbeIntegrationTests(unittest.TestCase):
                 for key in runs[0][1]:
                     torch.testing.assert_close(runs[0][1][key], runs[1][1][key], rtol=0, atol=0)
 
+    def test_nitp_cosgram_training_with_diagnostics(self):
+        for name in ("hstu", "tiger"):
+            with self.subTest(model=name), tempfile.TemporaryDirectory() as directory:
+                reference = write_reference(directory, TinyDataset())
+                runs = []
+                def setup_test_logger(path, **kwargs):
+                    Path(path).mkdir(parents=True, exist_ok=True)
+                    return Mock()
+
+                for enabled in (False, True):
+                    root = Path(directory) / str(enabled)
+                    with patch("trainers.general_trainer.setup_logger",
+                               side_effect=setup_test_logger):
+                        result = train(
+                            model_name=name, model_config=CONFIGS[name], dataset=TinyDataset,
+                            save_dir_root=str(root), linear_probe_reference_path=str(reference),
+                            epochs=1, batch_size=2, infer_batch_size=2, num_workers=0,
+                            device="cpu", codebook_size=4, sem_id_dim=3, max_seq_len=2,
+                            beam_size=1, top_ks=(1,), mse_loss_weight=5.,
+                            align_loss_type="cosgram", cos_loss_weight=0.8,
+                            nitp_weight=0.5, nitp_target_layer=2,
+                            linear_probe=enabled, category_probe=False,
+                            linear_probe_max_epochs=2, linear_probe_patience=1,
+                            sequence_geometry=enabled, sequence_geometry_cosine_pairs=16,
+                        )
+                    checkpoint = next(Path(str(root) + "_cw0.8").rglob("best_model*.pt"))
+                    state = torch.load(checkpoint, weights_only=True)
+                    self.assertTrue(any(key.startswith("nitp_projector.") for key in state))
+                    self.assertEqual(result["model_config"]["nitp_target_layer"], 2)
+                    self.assertEqual(result["nitp_weight"], 0.5)
+                    self.assertIn("nitp_w0.5_layer2", str(checkpoint))
+                    if enabled:
+                        self.assertEqual(result["sequence_geometry_latest"]["tokens"], 12)
+                        self.assertEqual(result["linear_probe_latest"]["epoch"], 0)
+                        if name == "tiger":
+                            self.assertEqual(
+                                result["encoder_probe_latest"]["hidden_source"], "encoder_mean"
+                            )
+                    runs.append((result, state))
+                self.assertEqual(runs[0][0]["test"], runs[1][0]["test"])
+                for key in runs[0][1]:
+                    torch.testing.assert_close(runs[0][1][key], runs[1][1][key], rtol=0, atol=0)
+
     def test_alignment_losses_unchanged(self):
         model = build_sid_model("hstu", 4, 3, 2, CONFIGS["hstu"])
         configure_alignment(model, 5, "cosgram")

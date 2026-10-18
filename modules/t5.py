@@ -253,6 +253,7 @@ class T5Attention(nn.Module):
         position_bias: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        kv_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Self-attention (key_value_states=None) or cross-attention.
@@ -271,6 +272,10 @@ class T5Attention(nn.Module):
             key_states, value_states = past_key_value
         else:
             current_states = key_value_states if is_cross_attention else hidden_states
+            if kv_hidden_states is not None:
+                if is_cross_attention:
+                    raise ValueError("KV fusion is only supported for self-attention")
+                current_states = kv_hidden_states
             key_states = self.k(current_states)
             value_states = self.v(current_states)
             key_states = key_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
@@ -338,11 +343,19 @@ class T5LayerSelfAttention(nn.Module):
         position_bias: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        first_token_fusion=None,
+        fusion_emb=None,
     ):
         normed = self.layer_norm(hidden_states)
+        kv_hidden_states = None
+        if first_token_fusion is not None:
+            # Change only the start token's K/V input, not Q or the residual.
+            fused = first_token_fusion(normed[:, 0], fusion_emb)
+            kv_hidden_states = torch.cat((fused[:, None], normed[:, 1:]), dim=1)
         attention_output = self.SelfAttention(
             normed, mask=attention_mask, position_bias=position_bias,
             past_key_value=past_key_value, use_cache=use_cache,
+            kv_hidden_states=kv_hidden_states,
         )
         hidden_states = hidden_states + self.dropout(attention_output[0])
         outputs = (hidden_states,) + attention_output[1:]  # position_bias, maybe cache
@@ -413,6 +426,8 @@ class T5Block(nn.Module):
         encoder_decoder_position_bias: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple] = None,
         use_cache: bool = False,
+        first_token_fusion=None,
+        fusion_emb=None,
     ):
         """
         Returns:
@@ -434,6 +449,7 @@ class T5Block(nn.Module):
             hidden_states, attention_mask=attention_mask,
             position_bias=position_bias, past_key_value=self_attn_past,
             use_cache=use_cache,
+            first_token_fusion=first_token_fusion, fusion_emb=fusion_emb,
         )
         hidden_states = sa_outputs[0]
         self_position_bias = sa_outputs[1]
@@ -530,6 +546,9 @@ class T5Stack(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         past_key_values: Optional[Tuple] = None,
         use_cache: bool = False,
+        first_token_fusion=None,
+        fusion_emb=None,
+        nitp_target_layer=0,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Returns:
@@ -579,6 +598,12 @@ class T5Stack(nn.Module):
         position_bias = None
         encoder_decoder_position_bias = None
         present_key_values = [] if use_cache else None
+        nitp_target = None
+        if nitp_target_layer and (
+            not self.is_decoder or use_cache or past_key_values is not None
+            or not 1 <= nitp_target_layer <= len(self.block)
+        ):
+            raise ValueError("NITP capture requires a valid full-prefix decoder layer")
 
         for i, layer_module in enumerate(self.block):
             layer_past = past_key_values[i] if past_key_values is not None else None
@@ -592,9 +617,19 @@ class T5Stack(nn.Module):
                 encoder_decoder_position_bias=encoder_decoder_position_bias,
                 past_key_value=layer_past,
                 use_cache=use_cache,
+                # Full-prefix training/recomputation replaces position zero;
+                # incremental decoding already has its fused K/V in the cache.
+                first_token_fusion=(
+                    first_token_fusion
+                    if self.is_decoder and i == len(self.block) - 1 and past_length == 0
+                    else None
+                ),
+                fusion_emb=fusion_emb,
             )
 
             hidden_states = layer_outputs[0]
+            if i + 1 == nitp_target_layer:
+                nitp_target = hidden_states[:, 1:, :].detach().clone()
             position_bias = layer_outputs[1]
 
             # cross position bias for decoder
@@ -609,6 +644,8 @@ class T5Stack(nn.Module):
 
         if use_cache:
             return hidden_states, tuple(present_key_values)
+        if nitp_target_layer:
+            return hidden_states, nitp_target
         return (hidden_states,)
 
 
@@ -695,6 +732,10 @@ class T5ForConditionalGeneration(nn.Module):
         encoder_outputs: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
         past_key_values: Optional[Tuple] = None,
+        first_token_fusion=None,
+        fusion_emb=None,
+        fusion_position="out",
+        nitp_target_layer=0,
     ):
         """
         Returns an object with .loss and .logits attributes (SimpleNamespace).
@@ -720,6 +761,8 @@ class T5ForConditionalGeneration(nn.Module):
             )
 
         # Decode
+        if fusion_position not in ("out", "attn"):
+            raise ValueError("fusion_position must be out or attn")
         decoder_out = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -727,10 +770,18 @@ class T5ForConditionalGeneration(nn.Module):
             encoder_attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            first_token_fusion=first_token_fusion if fusion_position == "attn" else None,
+            fusion_emb=fusion_emb,
+            nitp_target_layer=nitp_target_layer,
         )
 
         sequence_output = decoder_out[0]
         present_key_values = decoder_out[1] if use_cache else None
+        past_length = 0 if past_key_values is None else past_key_values[0][0][0].shape[2]
+        if first_token_fusion is not None and fusion_position == "out" and past_length == 0:
+            fused = first_token_fusion(sequence_output[:, 0], fusion_emb)
+            sequence_output = torch.cat((fused[:, None], sequence_output[:, 1:]), dim=1)
+        output_hidden = sequence_output
 
         # HF quirk: scale decoder output when tie_word_embeddings=True
         if self.config.scale_decoder_outputs:
@@ -746,7 +797,8 @@ class T5ForConditionalGeneration(nn.Module):
         # Return a simple namespace-like object
         return _Seq2SeqLMOutput(
             loss=loss, logits=lm_logits, past_key_values=present_key_values,
-            last_hidden_state=decoder_out[0],
+            last_hidden_state=output_hidden,
+            nitp_target=decoder_out[-1] if nitp_target_layer else None,
         )
 
     # ------ generation (beam search) ------
@@ -906,10 +958,12 @@ class T5ForConditionalGeneration(nn.Module):
 # Output container
 # ──────────────────────────────────────────────
 class _Seq2SeqLMOutput:
-    __slots__ = ('loss', 'logits', 'past_key_values', 'last_hidden_state')
+    __slots__ = ('loss', 'logits', 'past_key_values', 'last_hidden_state', 'nitp_target')
 
-    def __init__(self, loss, logits, past_key_values=None, last_hidden_state=None):
+    def __init__(self, loss, logits, past_key_values=None, last_hidden_state=None,
+                 nitp_target=None):
         self.loss = loss
         self.logits = logits
         self.past_key_values = past_key_values
         self.last_hidden_state = last_hidden_state
+        self.nitp_target = nitp_target

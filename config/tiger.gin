@@ -28,6 +28,16 @@ train.d_kv=64
 train.dropout_rate=0.1
 train.feed_forward_proj='relu'
 
+# Optional current-item fusion; none keeps the original TIGER behavior.
+# add: h + MLP(emb); concat: MLP([h, emb]).
+# out: decoder start output only; attn: final decoder self-attention start K/V.
+train.fusion_mode="none"  # none | add | concat
+train.fusion_position="out"  # out | attn
+
+# NITP: detached next-token decoder block output, one-based layer index.
+train.nitp_weight=0.0
+train.nitp_target_layer=1  # try 1 | 2 | 3 independently
+
 # Data config
 train.codebook_size=256
 train.sem_id_dim=3

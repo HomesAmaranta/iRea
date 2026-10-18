@@ -12,6 +12,7 @@ class SIDOutput:
     loss: Optional[torch.Tensor]
     logits: torch.Tensor
     last_hidden_state: torch.Tensor
+    nitp_loss: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -47,21 +48,30 @@ class SIDModelMixin:
         self._validate_inp(inp)
         ids = inp["input_ids"]
         labels = inp.get("labels")
+        auxiliary_loss = None
         if labels is not None:
             if labels.shape != (ids.shape[0], self.sem_id_dim):
                 raise ValueError("labels must contain one complete target SID per sample")
             if (labels <= 0).any() or (labels > self.codebook_size * self.sem_id_dim).any():
                 raise ValueError("Target SID tokens must be offset-encoded, without padding")
             # The last history token predicts c0; each target prefix predicts the next code.
-            ids = torch.cat((ids, labels[:, :-1]), dim=1)
-            hidden = self._encode_sid_sequence(ids, inp)[:, -self.sem_id_dim:, :]
+            if self.training and getattr(self, "nitp_weight", 0) > 0:
+                from modules.nitp import nitp_loss
+                history_length = ids.shape[1]
+                ids = torch.cat((ids, labels), dim=1)
+                full_hidden, target = self._encode_sid_sequence(ids, inp, nitp=True)
+                hidden = full_hidden[:, history_length - 1:-1, :]
+                auxiliary_loss = nitp_loss(self.nitp_projector, hidden, target)
+            else:
+                ids = torch.cat((ids, labels[:, :-1]), dim=1)
+                hidden = self._encode_sid_sequence(ids, inp)[:, -self.sem_id_dim:, :]
         else:
             hidden = self._encode_sid_sequence(ids, inp)[:, -1:, :]
         logits = self._lm_logits(hidden)
         loss = None if labels is None else F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), labels.reshape(-1)
         )
-        return SIDOutput(loss, logits, hidden)
+        return SIDOutput(loss, logits, hidden, auxiliary_loss)
 
     def _encode_sid_sequence(self, ids, inp):
         return self._encode(ids)

@@ -14,6 +14,8 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 from models.sid import SIDModelMixin
+from modules.fusion import ItemFusion
+from modules.nitp import configure_nitp
 
 
 class HSTU(SIDModelMixin, nn.Module):
@@ -40,6 +42,11 @@ class HSTU(SIDModelMixin, nn.Module):
         use_temporal_bias: bool = False,
         codebook_size: Optional[int] = None,
         sem_id_dim: int = 3,
+        fusion_mode: str = "none",
+        fusion_position: str = "out",
+        fusion_dim: int = 0,
+        nitp_weight: float = 0.0,
+        nitp_target_layer: int = 1,
     ):
         """
         Args:
@@ -88,6 +95,26 @@ class HSTU(SIDModelMixin, nn.Module):
         self.final_norm = nn.LayerNorm(embed_dim)
 
         self._init_weights()
+        self.fusion_mode = fusion_mode
+        self.fusion_position = fusion_position
+        if fusion_mode not in ("none", "add", "concat"):
+            raise ValueError("fusion_mode must be none, add or concat")
+        if fusion_position not in ("out", "attn"):
+            raise ValueError("fusion_position must be out or attn")
+        if fusion_mode != "none":
+            if codebook_size is None or num_blocks < 1:
+                raise ValueError("HSTU fusion requires SID mode and at least one block")
+            # Initialize after the backbone, matching TIGER's fusion initialization.
+            self.item_fusion = ItemFusion(embed_dim, fusion_dim, fusion_mode)
+        configure_nitp(self, embed_dim, num_blocks, nitp_weight, nitp_target_layer)
+
+    def _fusion_embedding(self, inp):
+        embedding = inp.get("fusion_emb")
+        if (embedding is None or embedding.ndim != 2
+                or embedding.shape != (inp["input_ids"].shape[0], self.item_fusion.embedding_dim)
+                or not torch.isfinite(embedding).all()):
+            raise ValueError("Fusion requires a finite current-item fusion_emb of shape [B, fusion_dim]")
+        return embedding.detach()
 
     def _init_weights(self):
         for module in self.modules():
@@ -103,7 +130,8 @@ class HSTU(SIDModelMixin, nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def _encode(self, input_ids, timestamps=None):
+    def _encode(self, input_ids, timestamps=None, fusion_emb=None, fusion_index=None,
+                nitp_start=None):
         """Expose the unchanged HSTU backbone's final hidden representations."""
         _, length = input_ids.shape
         causal_mask = torch.triu(
@@ -111,9 +139,21 @@ class HSTU(SIDModelMixin, nn.Module):
         ).bool()
         padding_mask = input_ids == 0
         x = self.emb_dropout(self.item_embedding(input_ids))
-        for layer in self.layers:
-            x = layer(x, causal_mask, padding_mask, timestamps)
-        return self.final_norm(x)
+        target = None
+        for index, layer in enumerate(self.layers):
+            kwargs = {}
+            if self.fusion_mode != "none" and self.fusion_position == "attn" and index == len(self.layers) - 1:
+                kwargs = dict(item_fusion=self.item_fusion, fusion_emb=fusion_emb,
+                              fusion_index=fusion_index)
+            x = layer(x, causal_mask, padding_mask, timestamps, **kwargs)
+            if nitp_start is not None and index + 1 == self.nitp_target_layer:
+                # Capture block output before the backbone's final normalization.
+                target = x[:, nitp_start:, :].detach().clone()
+        x = self.final_norm(x)
+        if self.fusion_mode != "none" and self.fusion_position == "out":
+            fused = self.item_fusion(x[:, fusion_index], fusion_emb)
+            x = torch.cat((x[:, :fusion_index], fused[:, None], x[:, fusion_index + 1:]), dim=1)
+        return (x, target) if nitp_start is not None else x
 
     def _validate_inp(self, inp):
         super()._validate_inp(inp)
@@ -131,27 +171,38 @@ class HSTU(SIDModelMixin, nn.Module):
         if timestamps.masked_select(inp["attention_mask"] == 0).ne(0).any():
             raise ValueError("HSTU padding timestamps must be zero")
 
-    def _encode_sid_sequence(self, ids, inp):
-        if not self.use_temporal_bias:
-            return self._encode(ids)
-        timestamps = inp.get("timestamps")
+    def _encode_sid_sequence(self, ids, inp, nitp=False):
+        timestamps = inp.get("timestamps") if self.use_temporal_bias else None
         if timestamps is not None:
             prefix_length = ids.shape[1] - timestamps.shape[1]
             # Match the original HSTU collate: unknown target times use the last history time.
             timestamps = torch.cat(
                 (timestamps, timestamps[:, -1:].expand(-1, prefix_length)), dim=1
             )
-        return self._encode(ids, timestamps)
+        kwargs = {}
+        if nitp:
+            kwargs["nitp_start"] = inp["input_ids"].shape[1]
+        if self.fusion_mode != "none":
+            # Left-padded histories end here; generated target tokens never move this slot.
+            kwargs.update(fusion_emb=self._fusion_embedding(inp),
+                          fusion_index=inp["input_ids"].shape[1] - 1)
+        return self._encode(ids, timestamps, **kwargs)
 
     def _generation_context(self, inp):
         context = super()._generation_context(inp)
         if self.use_temporal_bias and "timestamps" in inp:
             context += (inp["timestamps"],)
+        if self.fusion_mode != "none":
+            context += (self._fusion_embedding(inp),)
         return context
 
     def _next_sid_token(self, context, prefix):
         ids = torch.cat((context[0], prefix), dim=1)
-        inp = {} if len(context) == 2 else {"timestamps": context[2]}
+        inp = {"input_ids": context[0], "attention_mask": context[1]}
+        if self.use_temporal_bias:
+            inp["timestamps"] = context[2]
+        if self.fusion_mode != "none":
+            inp["fusion_emb"] = context[3 if self.use_temporal_bias else 2]
         hidden = self._encode_sid_sequence(ids, inp)[:, -1, :]
         return hidden @ self.item_embedding.weight.T, hidden
 
@@ -175,6 +226,8 @@ class HSTU(SIDModelMixin, nn.Module):
         """
         if isinstance(input_ids, dict):
             return self.forward_sid(input_ids)
+        if self.fusion_mode != "none":
+            raise ValueError("Fusion requires the SID dictionary interface with fusion_emb")
         x = self._encode(input_ids, timestamps)
 
         # Prediction via dot product with item embeddings
@@ -206,6 +259,8 @@ class HSTU(SIDModelMixin, nn.Module):
         Instead of computing logits over ALL items, samples a small set of
         negatives per batch for efficiency and different optimization landscape.
         """
+        if self.fusion_mode != "none":
+            raise ValueError("Fusion requires the SID dictionary interface with fusion_emb")
         B, L = input_ids.shape
         device = input_ids.device
 
@@ -331,20 +386,35 @@ class HSTULayer(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+    def _project(self, x, item_fusion=None, fusion_emb=None, fusion_index=None):
+        projected = F.silu(self.projection(x))
+        U, V, Q, K = projected.chunk(4, dim=-1)
+        if item_fusion is not None:
+            if fusion_index is None or not 0 <= fusion_index < x.shape[1]:
+                raise ValueError("Fusion index must identify the last history token")
+            fused = item_fusion(x[:, fusion_index], fusion_emb)
+            # Keep the original SiLU projection; discard fused U/Q to leave their paths unchanged.
+            _, fused_v, _, fused_k = F.silu(self.projection(fused)).chunk(4, dim=-1)
+            V = torch.cat((V[:, :fusion_index], fused_v[:, None], V[:, fusion_index + 1:]), dim=1)
+            K = torch.cat((K[:, :fusion_index], fused_k[:, None], K[:, fusion_index + 1:]), dim=1)
+        return U, V, Q, K
+
     def forward(
         self,
         x: torch.Tensor,  # [B, L, D]
         causal_mask: torch.Tensor,  # [L, L]
         padding_mask: torch.Tensor,  # [B, L]
         timestamps: Optional[torch.Tensor] = None,  # [B, L]
+        item_fusion=None,
+        fusion_emb=None,
+        fusion_index=None,
     ) -> torch.Tensor:
         B, L, D = x.shape
         residual = x
 
         # === Pointwise Projection ===
         # Project and apply SiLU, then split into U, V, Q, K
-        projected = F.silu(self.projection(x))  # [B, L, 4D]
-        U, V, Q, K = projected.chunk(4, dim=-1)  # Each [B, L, D]
+        U, V, Q, K = self._project(x, item_fusion, fusion_emb, fusion_index)
 
         # Reshape for multi-head attention
         Q = Q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, L, d]
