@@ -3,14 +3,14 @@ set -euo pipefail
 
 # Edit these arrays to select the experiment grid.
 models=(lcrec)
-datasets=(beauty sports toys)
-align_targets=(item latent quantized)
+datasets=(toys)
+align_targets=(item )
 mse_loss_weights=(5)
-align_items=(current)
+align_items=(next)
 align_sources=(last_inp)
 learning_rates=(5e-4)
-align_loss_types=(cos gram cosgram) # gram: Linear(d,d); cosgram: 0.5*cos + 0.5*gram
-gpu_ids="0,1,2,3"
+align_loss_types=(cos) # gram: Linear(d,d); cosgram: 0.5*cos + 0.5*gram
+gpu_ids="4,5,6,7"
 
 # Pass the four visible GPUs above to each model's bash launcher.
 # Runs execute sequentially, without a task scheduler.

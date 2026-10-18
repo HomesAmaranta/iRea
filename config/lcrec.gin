@@ -38,6 +38,8 @@ train_lcrec.mixed_precision = "bf16"
 train_lcrec.early_stop_metric = "ce"
 train_lcrec.early_stop_patience = 2
 train_lcrec.eval_valid_every_n_epochs = 1
+# Only CKA/acc use optimizer-step intervals; validation keeps the epoch schedule.
+train_lcrec.linear_probe_every_steps = 50
 train_lcrec.beam_size = 20
 train_lcrec.top_ks = [5, 10]
 train_lcrec.constrain_sid = True

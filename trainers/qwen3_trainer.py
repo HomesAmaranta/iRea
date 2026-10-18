@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+from uuid import uuid4
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 import gin
@@ -17,6 +18,11 @@ from transformers import AutoTokenizer, get_scheduler
 from data.lcrec import DEFAULT_PROMPT, LCSIDCollator, load_lm_datasets, register_sid_tokens
 from models.lcrec import build_lcrec
 from modules.utils import get_run_split, parse_config, setup_logger
+from trainers.qwen3_item_probe import Qwen3ItemProbe, on_main_process
+from trainers.affine_probe import validate_fit_config
+from trainers.representation_geometry import (
+    GEOMETRY_DESCRIPTION, SequenceGeometryEpoch, geometry_log_metrics,
+)
 from trainers.trainer_utils import save_run_results, set_seed, setup_accelerator
 
 
@@ -71,6 +77,25 @@ def aggregate_training_log(accelerator, epoch, ce_total, align_total, count, wei
         raise ValueError("No training samples")
     ce, align = totals[0] / totals[2], totals[1] / totals[2]
     return {"epoch": epoch, "train/ce": ce, "train/align": align, "train/loss": ce + weight * align}
+
+
+def aggregate_sequence_geometry(accelerator, stats):
+    """Reduce sums and valid counts, not per-rank averages or pooled hidden."""
+    keys = ("effective_rank", "avg_cosine")
+    totals = accelerator.reduce(torch.tensor(
+        [stats.sums[key] for key in keys] + [stats.counts[key] for key in keys]
+        + [stats.batches, stats.tokens, stats.nonzero_tokens, stats.sampled_pairs],
+        device=accelerator.device, dtype=torch.float64,
+    ), reduction="sum").tolist()
+    counts = dict(zip(keys, map(int, totals[2:4])))
+    batches, tokens, nonzero_tokens, pairs = map(int, totals[4:])
+    return {
+        **{key: totals[i] / counts[key] if counts[key] else None
+           for i, key in enumerate(keys)},
+        "batches": batches, "tokens": tokens, "nonzero_tokens": nonzero_tokens,
+        "sampled_pairs": pairs, "valid_batches": counts,
+        "skipped_batches": {key: batches - counts[key] for key in keys},
+    }
 
 
 @torch.no_grad()
@@ -165,7 +190,35 @@ def train_lcrec(
     align_source="last_inp",
     align_loss_type="cos",
     wandb_logging=False,
+    linear_probe=None,
+    linear_probe_every_steps=50,
+    linear_probe_batch_size=32,
+    linear_probe_seed=42,
+    linear_probe_reference_path=None,
+    linear_probe_learning_rate=1e-3,
+    linear_probe_max_epochs=3000,
+    linear_probe_patience=50,
+    sequence_geometry=True,
+    sequence_geometry_cosine_pairs=4096,
+    sequence_geometry_seed=42,
 ):
+    if linear_probe is None:
+        linear_probe = model_name == "lcrec"
+    if not isinstance(linear_probe_every_steps, int) or linear_probe_every_steps <= 0:
+        raise ValueError("linear_probe_every_steps must be a positive integer")
+    if not isinstance(linear_probe, bool):
+        raise ValueError("linear_probe must be a boolean or None")
+    if linear_probe and (model_name != "lcrec" or quantizer != "rqvae"):
+        raise ValueError("The Qwen3 item probe currently supports LCRec with RQVAE only")
+    if linear_probe and linear_probe_batch_size <= 0:
+        raise ValueError("Invalid item probe batch size")
+    validate_fit_config(linear_probe_learning_rate, linear_probe_max_epochs, linear_probe_patience)
+    if not isinstance(sequence_geometry, bool):
+        raise ValueError("sequence_geometry must be a boolean")
+    if (isinstance(sequence_geometry_cosine_pairs, bool)
+            or not isinstance(sequence_geometry_cosine_pairs, int)
+            or sequence_geometry_cosine_pairs <= 0):
+        raise ValueError("sequence_geometry_cosine_pairs must be a positive integer")
     run_config = dict(locals())
     if model_name not in ("lcrec", "onerec") or quantizer not in ("rqvae", "rqkmeans"):
         raise ValueError("Use lcrec/onerec and rqvae/rqkmeans")
@@ -193,12 +246,25 @@ def train_lcrec(
     accelerator = setup_accelerator(
         split_batches=False, gradient_accumulate_every=gradient_accumulate_every,
         amp=mixed_precision != "no", mixed_precision_type=mixed_precision,
+        timeout_minutes=60 if linear_probe else 3,
     )
     paths = {"model": model_name, "split": get_run_split("beauty")}
     save_dir = save_dir_root.format(**paths)
     if mse_loss_weight > 0:
         save_dir += f"_{align_target}_{align_item}_{align_source}_{align_loss_type}{mse_loss_weight:g}"
     logger = setup_training_logger(accelerator, save_dir, run_config, paths)
+    sequence_config = dict(
+        enabled=sequence_geometry, cosine_pairs_per_batch=sequence_geometry_cosine_pairs,
+        seed=sequence_geometry_seed,
+        method={**GEOMETRY_DESCRIPTION,
+                "sequence_hidden": "Qwen3 final decoder layer: answer separator, SID0, SID1; "
+                                   "three supervised SID prediction positions, no prompt/padding",
+                "epoch_reduction": "Arithmetic mean of valid local microbatch metrics across "
+                                   "all ranks; includes actual distributed sampler padding"},
+    )
+    sequence_path = (os.path.join(save_dir, f"sequence_geometry_{uuid4().hex}.jsonl")
+                     if sequence_geometry and accelerator.is_main_process else None)
+    sequence_latest = None
     # Let rank zero populate missing embedding caches before other ranks read them.
     with accelerator.main_process_first(), main_process_loading_output(accelerator):
         datasets = load_lm_datasets(
@@ -211,6 +277,13 @@ def train_lcrec(
         )
     if any(len(value) == 0 for value in datasets.values()):
         raise ValueError("Train, valid and test datasets must all be nonempty")
+    item_probe = None
+    if linear_probe:
+        reference_path = (
+            linear_probe_reference_path.format(**paths) if linear_probe_reference_path else
+            os.path.join(dataset_folder.format(**paths), "processed", paths["split"],
+                         "item_emb_sentence-t5-xl.parquet")
+        )
     with main_process_loading_output(accelerator):
         tokenizer = AutoTokenizer.from_pretrained(base_model, padding_side="left")
     if tokenizer.eos_token_id is None:
@@ -221,6 +294,13 @@ def train_lcrec(
     collator = LCSIDCollator(
         tokenizer, sid_token_ids, max_seq_len, model_max_length, prompt_template
     )
+    if linear_probe:
+        item_probe = on_main_process(accelerator, lambda: Qwen3ItemProbe(
+            datasets["train"], reference_path, save_dir, logger, collator=collator,
+            batch_size=linear_probe_batch_size, seed=linear_probe_seed,
+            learning_rate=linear_probe_learning_rate, max_epochs=linear_probe_max_epochs,
+            patience=linear_probe_patience,
+        ))
     loaders = {
         split: DataLoader(
             dataset, batch_size=batch_size if split == "train" else infer_batch_size,
@@ -254,6 +334,7 @@ def train_lcrec(
     )
     monitor = "ce" if early_stop_metric == "ce" else f"Recall@{max(top_ks)}"
     logger.info(f"Backbone: {base_model}; SID: {quantizer}, encoder: {encoder_model_name}")
+    logger.info("Checkpoint writing disabled; retaining results, logs and metadata only.")
     logger.info(f"Early stopping: {monitor}, patience: {early_stop_patience} validations")
     logger.info(f"Samples: { {key: len(value) for key, value in datasets.items()} }")
     logger.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -264,16 +345,64 @@ def train_lcrec(
     best_value = float("inf") if early_stop_metric == "ce" else -float("inf")
     best_model, best_epoch, wait = None, -1, 0
     best_test = None
+    best_probe = None
+    global_step, best_step = 0, -1
+    logger.info("Validation: every %d epochs; item probes: every %d optimizer updates (enabled=%s)",
+                eval_valid_every_n_epochs, linear_probe_every_steps, linear_probe)
+
+    def run_evaluation(epoch):
+        nonlocal best_value, best_epoch, best_step, wait, best_probe, best_model, best_test
+        metrics = {"epoch": epoch, "global_step": global_step}
+        unwrapped = accelerator.unwrap_model(model, keep_fp32_wrapper=False)
+        valid = evaluate_lm(
+            unwrapped, loaders["valid"], accelerator, metric=early_stop_metric,
+            beam_size=beam_size, top_ks=top_ks, constrain_sid=constrain_sid,
+        )
+        value = valid[monitor]
+        improved = value < best_value if early_stop_metric == "ce" else value > best_value
+        if improved:
+            best_value, best_epoch, best_step, wait = value, epoch, global_step, 0
+            if item_probe is not None:
+                # A preceding probe step is not the epoch-end selected model.
+                latest = item_probe.latest
+                best_probe = latest if latest and latest["global_step"] == global_step else None
+            best_model = None
+            best_model = copy.deepcopy(unwrapped).eval().requires_grad_(False)
+            if accelerator.is_main_process:
+                with open(os.path.join(save_dir, "sid_catalogue.json"), "w") as handle:
+                    json.dump(datasets["train"].sem_ids_list, handle)
+                with open(os.path.join(save_dir, "run_config.json"), "w") as handle:
+                    json.dump(run_config, handle, indent=2)
+            best_test = evaluate_lm(
+                best_model, loaders["test"], accelerator, metric="hr",
+                beam_size=beam_size, top_ks=top_ks, constrain_sid=constrain_sid,
+            )
+            metrics.update({f"test/{key}": value for key, value in best_test.items()})
+            logger.info(f"New best epoch: {best_epoch}, step: {best_step}; test: {best_test}")
+        else:
+            wait += 1
+        metrics.update({f"valid/{key}": value for key, value in valid.items()})
+        logger.info(f"Epoch {epoch} step={global_step} - Valid: {valid}; "
+                    f"best epoch: {best_epoch}; best step: {best_step}; wait: {wait}")
+        if wandb is not None:
+            wandb.log(metrics)
+
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(epochs):
         model.train()
+        sequence_stats = (SequenceGeometryEpoch(
+            accelerator.device, sequence_geometry_cosine_pairs,
+            sequence_geometry_seed + epoch * accelerator.num_processes + accelerator.process_index,
+        ) if sequence_geometry else None)
         ce_total, align_total, count = 0.0, 0.0, 0
         for step, batch in enumerate(tqdm(
             loaders["train"], desc=f"Epoch {epoch}", disable=not accelerator.is_main_process
         )):
+            updated = False
             with accelerator.accumulate(model):
                 with accelerator.autocast():
-                    output = model(batch)
+                    output = (model(batch, return_last_hidden_state=True)
+                              if sequence_geometry else model(batch))
                     loss = output.loss + mse_loss_weight * output.align_loss
                 if not torch.isfinite(loss):
                     raise RuntimeError("Non-finite training loss")
@@ -287,61 +416,69 @@ def train_lcrec(
                 optimizer.step()
                 if accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
                     scheduler.step()
+                    global_step += 1
+                    updated = True
                 optimizer.zero_grad(set_to_none=True)
             size = len(batch["labels"])
             ce_total += output.loss.item() * size
             align_total += output.align_loss.item() * size
             count += size
+            if sequence_stats is not None:
+                sequence_stats.update(
+                    output.last_hidden_state,
+                    torch.ones_like(batch["labels"], dtype=torch.bool),
+                )
+            if linear_probe and updated and global_step % linear_probe_every_steps == 0:
+                probe_metrics = on_main_process(accelerator, lambda: item_probe.evaluate(
+                    accelerator.unwrap_model(model, keep_fp32_wrapper=False),
+                    epoch, mixed_precision, global_step=global_step,
+                ))
+                if wandb is not None and probe_metrics is not None:
+                    wandb.log({"epoch": epoch, "global_step": global_step, **probe_metrics})
         log = aggregate_training_log(
             accelerator, epoch, ce_total, align_total, count, mse_loss_weight
         )
+        if sequence_stats is not None:
+            sequence_latest = {
+                "epoch": epoch, "global_step": global_step,
+                **aggregate_sequence_geometry(accelerator, sequence_stats),
+                "config": sequence_config,
+            }
+            log.update(geometry_log_metrics(sequence_latest, "geometry/sequence"))
+            if accelerator.is_main_process:
+                with open(sequence_path, "a") as handle:
+                    handle.write(json.dumps(sequence_latest, allow_nan=False) + "\n")
+                logger.info(
+                    "[SequenceGeometry] epoch=%d mean_effective_rank=%s mean_avg_cosine=%s "
+                    "batches=%d valid_batches=%s",
+                    epoch, sequence_latest["effective_rank"], sequence_latest["avg_cosine"],
+                    sequence_latest["batches"], sequence_latest["valid_batches"],
+                )
         logger.info(
             f"Epoch {epoch} - loss: {log['train/loss']:.6f}, "
             f"ntp: {log['train/ce']:.6f}, align: {log['train/align']:.6f}"
         )
         if epoch == 0 or (epoch + 1) % eval_valid_every_n_epochs == 0:
-            # Remove AMP's bound forward wrapper before copying; explicit autocast
-            # contexts above/below continue to control precision without aliasing it.
-            unwrapped = accelerator.unwrap_model(model, keep_fp32_wrapper=False)
-            valid = evaluate_lm(
-                unwrapped, loaders["valid"], accelerator, metric=early_stop_metric,
-                beam_size=beam_size, top_ks=top_ks, constrain_sid=constrain_sid,
-            )
-            value = valid[monitor]
-            improved = value < best_value if early_stop_metric == "ce" else value > best_value
-            if improved:
-                best_value, best_epoch, wait = value, epoch, 0
-                # Release the previous full copy before allocating the next one.
-                best_model = None
-                best_model = copy.deepcopy(unwrapped).eval().requires_grad_(False)
-                if accelerator.is_main_process:
-                    unwrapped.save_pretrained(os.path.join(save_dir, "best_model"), tokenizer)
-                    with open(os.path.join(save_dir, "sid_catalogue.json"), "w") as handle:
-                        json.dump(datasets["train"].sem_ids_list, handle)
-                    with open(os.path.join(save_dir, "run_config.json"), "w") as handle:
-                        json.dump(run_config, handle, indent=2)
-                best_test = evaluate_lm(
-                    best_model, loaders["test"], accelerator, metric="hr",
-                    beam_size=beam_size, top_ks=top_ks, constrain_sid=constrain_sid,
-                )
-                log.update({f"test/{key}": value for key, value in best_test.items()})
-                logger.info(f"New best epoch: {best_epoch}; test: {best_test}")
-            else:
-                wait += 1
-            log.update({f"valid/{key}": value for key, value in valid.items()})
-            logger.info(f"Epoch {epoch} - Valid: {valid}; best epoch: {best_epoch}; wait: {wait}")
+            run_evaluation(epoch)
         if wandb is not None:
             wandb.log(log)
         if wait >= early_stop_patience:
-            logger.info(f"Early stopping at epoch {epoch}; best epoch: {best_epoch}")
+            logger.info(f"Early stopping at epoch {epoch}, step {global_step}; "
+                        f"best epoch: {best_epoch}, best step: {best_step}")
             break
     if best_test is None:
         raise RuntimeError("No best model selected")
     # Reuse the test metrics from the latest validation improvement, without
     # evaluating again or selecting a checkpoint using test performance.
-    results = dict(best_epoch=best_epoch, best_valid_metric=monitor,
+    results = dict(best_epoch=best_epoch, best_step=best_step, global_step=global_step,
+                   best_valid_metric=monitor,
                    best_valid_value=best_value, test=best_test)
+    results.update(sequence_geometry=sequence_config, sequence_geometry_latest=sequence_latest,
+                   sequence_geometry_path=sequence_path)
     if accelerator.is_main_process:
+        if item_probe is not None:
+            results.update(linear_probe_latest=item_probe.latest, linear_probe_best=best_probe,
+                           linear_probe_directory=str(item_probe.directory))
         save_run_results(save_dir, model_name, paths["split"], seed, best_test,
                          config=run_config, extra=results)
         logger.info(f"Best epoch: {best_epoch}; cached best-model test: {best_test}")

@@ -11,6 +11,7 @@ class LCRecOutput(NamedTuple):
     loss: torch.Tensor
     ce_per_example: torch.Tensor
     align_loss: torch.Tensor
+    last_hidden_state: torch.Tensor | None = None
 
 
 class LCRecGeneration(NamedTuple):
@@ -54,7 +55,7 @@ class LCRec(nn.Module):
             raise ValueError("The SID catalogue must not be empty")
         self.prefix_tokens = {key: sorted(value) for key, value in self.prefix_tokens.items()}
 
-    def forward(self, batch):
+    def forward(self, batch, return_last_hidden_state=False):
         prompt_ids, targets = batch["input_ids"], batch["labels"]
         if targets.ndim != 2 or targets.shape[1] != self.sem_id_dim:
             raise ValueError("Targets must be complete SID token sequences")
@@ -65,11 +66,26 @@ class LCRec(nn.Module):
         positions = mask.cumsum(-1) - 1
         positions.masked_fill_(mask == 0, 0)
         use_alignment = self.training and self.has_alignment
-        outputs = self.backbone(
-            input_ids=input_ids, attention_mask=mask, position_ids=positions,
-            use_cache=False, output_hidden_states=use_alignment, return_dict=True,
-            logits_to_keep=self.sem_id_dim + 1,
-        )
+        captured = []
+        handle = None
+        if return_last_hidden_state:
+            causal_lm = (self.backbone.get_base_model()
+                         if hasattr(self.backbone, "get_base_model") else self.backbone)
+
+            def capture_prediction_hidden(module, args, hidden):
+                # Copy only supervised positions, never retain all layers or prompt hidden.
+                captured.append(hidden[:, -(self.sem_id_dim + 1):-1].detach().clone())
+
+            handle = causal_lm.model.norm.register_forward_hook(capture_prediction_hidden)
+        try:
+            outputs = self.backbone(
+                input_ids=input_ids, attention_mask=mask, position_ids=positions,
+                use_cache=False, output_hidden_states=use_alignment, return_dict=True,
+                logits_to_keep=self.sem_id_dim + 1,
+            )
+        finally:
+            if handle is not None:
+                handle.remove()
         logits = outputs.logits[:, -(self.sem_id_dim + 1):-1].float()
         per_example = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction="none"
@@ -106,7 +122,10 @@ class LCRec(nn.Module):
                 cos_loss = 1 - F.cosine_similarity(prediction, target, dim=-1).mean()
                 align_loss = (0.5 * cos_loss + 0.5 * gram_loss
                               if self.align_loss_type == "cosgram" else cos_loss)
-        return LCRecOutput(per_example.mean(), per_example, align_loss)
+        if return_last_hidden_state and len(captured) != 1:
+            raise RuntimeError("Expected one final-layer Qwen3 hidden capture")
+        return LCRecOutput(per_example.mean(), per_example, align_loss,
+                           captured[0] if return_last_hidden_state else None)
 
     @torch.no_grad()
     def generate(self, batch, num_beams=20, constrain_sid=True):

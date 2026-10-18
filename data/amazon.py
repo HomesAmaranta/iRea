@@ -164,6 +164,7 @@ class AmazonItemDataset(Dataset):
     def _load_embeddings(self) -> None:
         """Load embeddings from cached parquet file."""
         df = pd.read_parquet(self.parquet_path)
+        self.item_ids = df["ItemID"].to_numpy(copy=True)
         self.embeddings = np.stack(df['embedding'].values, axis=0)
         self.dim = self.embeddings.shape[-1]
         logger.info(f"Loaded {len(self.embeddings)} embeddings from {self.parquet_path}")
@@ -236,6 +237,7 @@ class AmazonItemDataset(Dataset):
         logger.info(f"Saved embeddings to {self.parquet_path}")
 
         # Store embeddings
+        self.item_ids = df["ItemID"].to_numpy(copy=True)
         self.embeddings = np.stack(df['embedding'].values, axis=0)
         self.dim = self.embeddings.shape[-1]
 
@@ -250,8 +252,10 @@ class AmazonItemDataset(Dataset):
 
         if self.train_test_split == "train":
             self.embeddings = self.embeddings[is_train.numpy()]
+            self.item_ids = self.item_ids[is_train.numpy()]
         elif self.train_test_split == "eval":
             self.embeddings = self.embeddings[~is_train.numpy()]
+            self.item_ids = self.item_ids[~is_train.numpy()]
 
     def __len__(self) -> int:
         return len(self.embeddings)
@@ -321,6 +325,7 @@ class AmazonSeqDataset(Dataset):
             encoder_model_name=encoder_model_name,
         )
         self.item_embeddings = torch.tensor(item_dataset.embeddings, dtype=torch.float32)
+        self.item_ids = item_dataset.item_ids.copy()
 
         # Load pretrained RQVAE and generate semantic IDs
         rqvae = RqVae(

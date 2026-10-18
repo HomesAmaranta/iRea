@@ -72,6 +72,16 @@ class Tiger(SIDModelMixin, nn.Module):
         )
         return SIDOutput(outputs.loss, outputs.logits, outputs.last_hidden_state)
 
+    def encode_item_hidden(self, inp):
+        """Last encoder layer for one complete SID, pooled before any normalization."""
+        self._validate_inp(inp)
+        if inp["input_ids"].shape[1] != self.sem_id_dim or not inp["attention_mask"].all():
+            raise ValueError("Encoder item mean requires one complete unpadded SID")
+        hidden = self.model.encoder(
+            input_ids=inp["input_ids"], attention_mask=inp["attention_mask"]
+        )[0]
+        return hidden.float().mean(dim=1)
+
     def _generation_context(self, inp):
         encoder_hidden = self.model.encoder(
             input_ids=inp["input_ids"], attention_mask=inp["attention_mask"]

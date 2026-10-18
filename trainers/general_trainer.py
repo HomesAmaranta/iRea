@@ -6,6 +6,7 @@ import math
 import os
 from contextlib import nullcontext
 from functools import partial
+from uuid import uuid4
 
 import gin
 import torch
@@ -19,6 +20,11 @@ from tqdm import tqdm
 from data.sid import sid_collate
 from models.factory import build_sid_model
 from modules.utils import get_run_split, parse_config, setup_logger
+from trainers.affine_probe import PROTOCOL, RECALL_KS, validate_fit_config
+from trainers.item_probe import ItemLinearProbe
+from trainers.representation_geometry import (
+    GEOMETRY_DESCRIPTION, SequenceGeometryEpoch, geometry_log_metrics,
+)
 from trainers.trainer_utils import set_seed, setup_wandb
 
 
@@ -202,6 +208,18 @@ def train(
     mse_loss_weight=0.0,
     mse_loss_mode="last",
     align_loss_type="cos",
+    linear_probe=True,
+    linear_probe_batch_size=256,
+    linear_probe_seed=42,
+    linear_probe_learning_rate=1e-3,
+    linear_probe_max_epochs=3000,
+    linear_probe_patience=50,
+    linear_probe_reference_path=None,
+    category_probe=True,
+    sequence_geometry=True,
+    sequence_geometry_cosine_pairs=4096,
+    sequence_geometry_seed=42,
+    tiger_encoder_probe=True,
 ):
     if min(epochs, batch_size, infer_batch_size, early_stop_patience,
            eval_valid_every_n_epochs, eval_test_every_epoch, wandb_log_interval) <= 0:
@@ -222,6 +240,24 @@ def train(
         raise ValueError("Only mse_loss_mode=last and align_loss_type=cos/gram/cosgram are supported")
     if not math.isfinite(mse_loss_weight) or mse_loss_weight < 0:
         raise ValueError("mse_loss_weight must be finite and nonnegative")
+    if not isinstance(linear_probe, bool):
+        raise ValueError("linear_probe must be a boolean")
+    if not isinstance(tiger_encoder_probe, bool):
+        raise ValueError("tiger_encoder_probe must be a boolean")
+    if not isinstance(category_probe, bool):
+        raise ValueError("category_probe must be a boolean")
+    if not isinstance(sequence_geometry, bool):
+        raise ValueError("sequence_geometry must be a boolean")
+    if (isinstance(sequence_geometry_cosine_pairs, bool)
+            or not isinstance(sequence_geometry_cosine_pairs, int)
+            or sequence_geometry_cosine_pairs <= 0):
+        raise ValueError("sequence_geometry_cosine_pairs must be a positive integer")
+    if (isinstance(linear_probe_batch_size, bool)
+            or not isinstance(linear_probe_batch_size, int) or linear_probe_batch_size <= 0):
+        raise ValueError("linear_probe_batch_size must be a positive integer")
+    validate_fit_config(
+        linear_probe_learning_rate, linear_probe_max_epochs, linear_probe_patience
+    )
     alignment_config = dict(
         align_target=align_target, align_item=align_item, mse_loss_weight=mse_loss_weight,
         mse_loss_mode=mse_loss_mode, align_loss_type=align_loss_type,
@@ -248,6 +284,18 @@ def train(
     paths = {"model": model_name, "split": get_run_split("beauty")}
     save_dir_root = save_dir_root.format(**paths)
     pretrained_rqvae_path = pretrained_rqvae_path.format(**paths)
+    reference_path = (linear_probe_reference_path or os.path.join(
+        dataset_folder, "processed", "{split}", "item_emb_sentence-t5-xl.parquet"
+    )).format(**paths)
+    probe_config = dict(
+        enabled=linear_probe, reference_path=reference_path, batch_size=linear_probe_batch_size,
+        seed=linear_probe_seed, protocol=PROTOCOL,
+        learning_rate=linear_probe_learning_rate, max_epochs=linear_probe_max_epochs,
+        patience=linear_probe_patience, recall_top_ks=list(RECALL_KS),
+        category_enabled=linear_probe and category_probe,
+        category_level=2,
+        tiger_encoder_mean_enabled=linear_probe and tiger_encoder_probe and model_name == "tiger",
+    )
     artifact_suffix = ""
     if mse_loss_weight > 0:
         weight_tag = str(mse_loss_weight).removesuffix(".0")
@@ -255,6 +303,20 @@ def train(
             f"_{align_target}_{align_item}_{align_loss_type}{weight_tag}_{mse_loss_mode}"
         )
     logger = setup_logger(save_dir_root, name=f"{model_name}{artifact_suffix}")
+    sequence_geometry_config = dict(
+        enabled=sequence_geometry, cosine_pairs_per_batch=sequence_geometry_cosine_pairs,
+        seed=sequence_geometry_seed, method=GEOMETRY_DESCRIPTION,
+    )
+    sequence_geometry_path = (os.path.join(
+        save_dir_root, f"sequence_geometry{artifact_suffix}_{uuid4().hex}.jsonl"
+    ) if sequence_geometry else None)
+    sequence_geometry_latest = None
+    if sequence_geometry:
+        logger.info(
+            "[SequenceGeometry] each training batch: output.last_hidden_state "
+            "(all target-prediction slots, not full history); epoch-end batch mean; "
+            f"cosine pairs/batch={sequence_geometry_cosine_pairs}; file={sequence_geometry_path}"
+        )
 
     if dataset is None:
         from data.amazon import AmazonSeqDataset
@@ -291,6 +353,29 @@ def train(
         if target is None or torch.as_tensor(target).ndim != 1:
             raise ValueError("Training dataset must provide an align_target_emb vector")
         configure_alignment(model, len(target), align_loss_type)
+    item_probe = None
+    encoder_probe = None
+    if linear_probe:
+        item_probe = ItemLinearProbe(
+            datasets["train"], reference_path, save_dir_root, logger,
+            batch_size=linear_probe_batch_size, seed=linear_probe_seed,
+            learning_rate=linear_probe_learning_rate,
+            max_epochs=linear_probe_max_epochs, patience=linear_probe_patience,
+            category_probe=category_probe,
+        )
+        logger.info(
+            "[ItemProbe] last position from normal single-item forward: "
+            + ("TIGER decoder start" if model_name == "tiger" else "last input SID token")
+        )
+        if model_name == "tiger" and tiger_encoder_probe:
+            encoder_probe = ItemLinearProbe(
+                datasets["train"], reference_path, save_dir_root, logger,
+                batch_size=linear_probe_batch_size, seed=linear_probe_seed,
+                learning_rate=linear_probe_learning_rate,
+                max_epochs=linear_probe_max_epochs, patience=linear_probe_patience,
+                category_probe=category_probe, hidden_source="encoder_mean",
+            )
+            logger.info("[ItemProbe:encoder_mean] mean of TIGER encoder's three SID tokens")
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = None
     if lr_schedule == "cosine":
@@ -330,6 +415,8 @@ def train(
                 "batch_size": batch_size, "beam_size": beam_size, "seed": seed,
                 "early_stop_metric": early_stop_metric,
                 "early_stop_patience": early_stop_patience,
+                "linear_probe": probe_config,
+                  "sequence_geometry": sequence_geometry_config,
                 **alignment_config,
             },
         )
@@ -346,6 +433,9 @@ def train(
     )
     for epoch in range(epochs):
         model.train()
+        sequence_stats = (SequenceGeometryEpoch(
+            device, sequence_geometry_cosine_pairs, sequence_geometry_seed + epoch
+        ) if sequence_geometry else None)
         loss_sum = 0.0
         ntp_loss_sum = 0.0
         align_loss_sum = 0.0
@@ -366,6 +456,10 @@ def train(
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
+            if sequence_stats is not None:
+                # SIDOutput is aligned with target labels, not the history attention mask.
+                # TIGER's decoder-start slot is a valid prediction position.
+                sequence_stats.update(output.last_hidden_state, inp["labels"] > 0)
             size = inp["labels"].shape[0]
             loss_sum += loss.item() * size
             ntp_loss_sum += output.loss.item() * size
@@ -387,6 +481,25 @@ def train(
             f"Epoch {epoch} - loss: {log['train/loss']:.6f}, "
             f"ntp: {log['train/ntp_loss']:.6f}, align: {log['train/align_loss']:.6f}"
         )
+        if sequence_stats is not None:
+            sequence_geometry_latest = {
+                "epoch": epoch, "global_step": global_step,
+                **sequence_stats.result(), "config": sequence_geometry_config,
+            }
+            log.update(geometry_log_metrics(sequence_geometry_latest, "geometry/sequence"))
+            logger.info(
+                "[SequenceGeometry] epoch=%d mean_effective_rank=%s mean_avg_cosine=%s "
+                "batches=%d valid_batches=%s",
+                epoch, sequence_geometry_latest["effective_rank"],
+                sequence_geometry_latest["avg_cosine"], sequence_stats.batches,
+                sequence_geometry_latest["valid_batches"],
+            )
+            with open(sequence_geometry_path, "a") as handle:
+                handle.write(json.dumps(sequence_geometry_latest, allow_nan=False) + "\n")
+        if item_probe is not None:
+            log.update(item_probe.evaluate(model, epoch, mixed_precision))
+        if encoder_probe is not None:
+            log.update(encoder_probe.evaluate(model, epoch, mixed_precision))
         if epoch == 0 or (epoch + 1) % eval_valid_every_n_epochs == 0:
             if early_stop_metric == "ce":
                 valid = evaluate_ce(
@@ -429,6 +542,14 @@ def train(
         "test": final_test,
         "model_config": model_config or {}, "codebook_size": codebook_size,
         "sem_id_dim": sem_id_dim, "max_seq_len": max_seq_len,
+        "linear_probe": probe_config,
+        "linear_probe_latest": item_probe.latest if item_probe is not None else None,
+        "linear_probe_dir": str(item_probe.directory) if item_probe is not None else None,
+        "encoder_probe_latest": encoder_probe.latest if encoder_probe is not None else None,
+        "encoder_probe_dir": str(encoder_probe.directory) if encoder_probe is not None else None,
+        "sequence_geometry": sequence_geometry_config,
+        "sequence_geometry_latest": sequence_geometry_latest,
+        "sequence_geometry_path": sequence_geometry_path,
         **alignment_config,
     }
     with open(os.path.join(save_dir_root, "results.json"), "w") as handle:

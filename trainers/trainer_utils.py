@@ -146,6 +146,7 @@ def setup_accelerator(
     gradient_accumulate_every: int = 1,
     amp: bool = False,
     mixed_precision_type: str = "fp16",
+    timeout_minutes: int = 3,
 ) -> Accelerator:
     """
     Setup and return an Accelerator instance.
@@ -161,8 +162,8 @@ def setup_accelerator(
     """
     # Suppress verbose topology logs, including an inherited NCCL_DEBUG=INFO.
     os.environ["NCCL_DEBUG"] = "WARN"
-    # Fail stalled distributed operations after three minutes.
-    nccl_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=3))
+    # Rank-zero diagnostics may legitimately keep other ranks waiting longer.
+    nccl_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=timeout_minutes))
     return Accelerator(
         split_batches=split_batches,
         gradient_accumulation_steps=gradient_accumulate_every,
