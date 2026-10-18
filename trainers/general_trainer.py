@@ -51,10 +51,12 @@ def configure_alignment(model, target_dim, align_loss_type="cos"):
         )
 
 
-def compute_alignment_loss(model, output, inp, align_loss_type="cos"):
+def compute_alignment_loss(model, output, inp, align_loss_type="cos", cos_loss_weight=0.5):
     """Align the first target-prediction slot to a frozen current/next item vector."""
     if align_loss_type not in ("cos", "gram", "cosgram"):
         raise ValueError("align_loss_type must be cos, gram or cosgram")
+    if not 0 <= cos_loss_weight <= 1:
+        raise ValueError("cos_loss_weight must be finite and in [0, 1]")
     # SASRec/HSTU: b_last. TIGER: decoder start PAD, before reading any target code.
     hidden = output.last_hidden_state[:, 0, :]
     target = inp.get("align_target_emb")
@@ -81,7 +83,8 @@ def compute_alignment_loss(model, output, inp, align_loss_type="cos"):
     cos_loss = 1.0 - F.cosine_similarity(
         prediction.float(), target.detach().float(), dim=-1
     ).mean()
-    return 0.5 * cos_loss + 0.5 * gram_loss if align_loss_type == "cosgram" else cos_loss
+    return (cos_loss_weight * cos_loss + (1 - cos_loss_weight) * gram_loss
+            if align_loss_type == "cosgram" else cos_loss)
 
 
 def autocast_context(device, mixed_precision):
@@ -202,6 +205,7 @@ def train(
     mse_loss_weight=0.0,
     mse_loss_mode="last",
     align_loss_type="cos",
+    cos_loss_weight=0.5,
 ):
     if min(epochs, batch_size, infer_batch_size, early_stop_patience,
            eval_valid_every_n_epochs, eval_test_every_epoch, wandb_log_interval) <= 0:
@@ -222,9 +226,12 @@ def train(
         raise ValueError("Only mse_loss_mode=last and align_loss_type=cos/gram/cosgram are supported")
     if not math.isfinite(mse_loss_weight) or mse_loss_weight < 0:
         raise ValueError("mse_loss_weight must be finite and nonnegative")
+    if not 0 <= cos_loss_weight <= 1:
+        raise ValueError("cos_loss_weight must be finite and in [0, 1]")
     alignment_config = dict(
         align_target=align_target, align_item=align_item, mse_loss_weight=mse_loss_weight,
         mse_loss_mode=mse_loss_mode, align_loss_type=align_loss_type,
+        cos_loss_weight=cos_loss_weight,
     )
     model_config = dict(model_config or {})
     architecture = {
@@ -254,6 +261,10 @@ def train(
         artifact_suffix = (
             f"_{align_target}_{align_item}_{align_loss_type}{weight_tag}_{mse_loss_mode}"
         )
+        if align_loss_type == "cosgram" and cos_loss_weight != 0.5:
+            ratio_tag = f"_cw{cos_loss_weight}"
+            artifact_suffix += ratio_tag
+            save_dir_root += ratio_tag
     logger = setup_logger(save_dir_root, name=f"{model_name}{artifact_suffix}")
 
     if dataset is None:
@@ -355,8 +366,10 @@ def train(
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, mixed_precision):
                 output = model(inp)
-                align_loss = (compute_alignment_loss(model, output, inp, align_loss_type)
-                              if mse_loss_weight > 0 else output.logits.new_zeros(()))
+                align_loss = (
+                    compute_alignment_loss(model, output, inp, align_loss_type, cos_loss_weight)
+                    if mse_loss_weight > 0 else output.logits.new_zeros(())
+                )
             if output.loss is None or not torch.isfinite(output.loss):
                 raise RuntimeError("Model returned a missing or non-finite NTP loss")
             loss = output.loss + mse_loss_weight * align_loss

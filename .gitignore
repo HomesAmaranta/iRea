@@ -215,6 +215,7 @@ scripts/*
 !scripts/train_lcrec.sh
 !scripts/train_onerec.sh
 !scripts/train_qwen3_grid.sh
+!scripts/train_hstu_scale.sh
 
 tests/
 

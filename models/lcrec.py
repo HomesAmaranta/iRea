@@ -20,12 +20,15 @@ class LCRecGeneration(NamedTuple):
 class LCRec(nn.Module):
     def __init__(self, backbone, sid_token_ids, eos_token_id, pad_token_id,
                  catalogue_sids, align_dim=None, align_source="last_inp",
-                 align_loss_type="cos"):
+                 align_loss_type="cos", cos_loss_weight=0.5):
         super().__init__()
         if align_source not in ("last_inp", "last_out", "mean_out"):
             raise ValueError("align_source must be last_inp, last_out or mean_out")
         if align_loss_type not in ("cos", "gram", "cosgram"):
             raise ValueError("align_loss_type must be cos, gram or cosgram")
+        if not 0 <= cos_loss_weight <= 1:
+            raise ValueError("cos_loss_weight must be finite and in [0, 1]")
+        self.cos_loss_weight = cos_loss_weight
         self.backbone = backbone
         self.register_buffer("sid_token_ids", sid_token_ids.clone())
         self.sem_id_dim = sid_token_ids.shape[0]
@@ -104,7 +107,7 @@ class LCRec(nn.Module):
                 if prediction.shape != target.shape:
                     raise ValueError("Alignment prediction and target dimensions differ")
                 cos_loss = 1 - F.cosine_similarity(prediction, target, dim=-1).mean()
-                align_loss = (0.5 * cos_loss + 0.5 * gram_loss
+                align_loss = (self.cos_loss_weight * cos_loss + (1 - self.cos_loss_weight) * gram_loss
                               if self.align_loss_type == "cosgram" else cos_loss)
         return LCRecOutput(per_example.mean(), per_example, align_loss)
 
@@ -149,7 +152,7 @@ def build_lcrec(base_model, tokenizer, sid_token_ids, catalogue_sids, mixed_prec
                 lora_r=8, lora_alpha=32, lora_dropout=0.05,
                 lora_target_modules=("q_proj", "v_proj", "o_proj", "up_proj", "down_proj"),
                 gradient_checkpointing=True, align_dim=None, align_source="last_inp",
-                align_loss_type="cos"):
+                align_loss_type="cos", cos_loss_weight=0.5):
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForCausalLM
 
@@ -173,5 +176,5 @@ def build_lcrec(base_model, tokenizer, sid_token_ids, catalogue_sids, mixed_prec
     return LCRec(
         backbone, sid_token_ids, tokenizer.eos_token_id, tokenizer.pad_token_id,
         catalogue_sids, align_dim=align_dim, align_source=align_source,
-        align_loss_type=align_loss_type,
+        align_loss_type=align_loss_type, cos_loss_weight=cos_loss_weight,
     )
