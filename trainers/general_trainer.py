@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from data.sid import sid_collate
 from models.factory import build_sid_model
+from modules.nitp import validate_nitp
 from modules.utils import get_run_split, parse_config, setup_logger
 from trainers.trainer_utils import set_seed, setup_wandb
 
@@ -206,7 +207,15 @@ def train(
     mse_loss_mode="last",
     align_loss_type="cos",
     cos_loss_weight=0.5,
+    fusion_mode="none",
+    fusion_position="out",
+    nitp_weight=0.0,
+    nitp_target_layer=1,
 ):
+    validate_nitp(nitp_weight, nitp_target_layer)
+    if nitp_weight > 0 and model_name not in ("hstu", "tiger"):
+        raise ValueError("NITP is currently supported only for tiger and hstu")
+    nitp_config = dict(nitp_weight=nitp_weight, nitp_target_layer=nitp_target_layer)
     if min(epochs, batch_size, infer_batch_size, early_stop_patience,
            eval_valid_every_n_epochs, eval_test_every_epoch, wandb_log_interval) <= 0:
         raise ValueError("Epochs, batch sizes and scheduling intervals must be positive")
@@ -228,12 +237,26 @@ def train(
         raise ValueError("mse_loss_weight must be finite and nonnegative")
     if not 0 <= cos_loss_weight <= 1:
         raise ValueError("cos_loss_weight must be finite and in [0, 1]")
+    if fusion_mode not in ("none", "add", "concat"):
+        raise ValueError("fusion_mode must be none, add or concat")
+    if fusion_position not in ("out", "attn"):
+        raise ValueError("fusion_position must be out or attn")
+    fusion_enabled = fusion_mode != "none"
+    if fusion_enabled and model_name not in ("tiger", "hstu"):
+        raise ValueError("Fusion is currently supported only for tiger and hstu")
+    if fusion_enabled and (align_item != "current" or mse_loss_weight != 0):
+        raise ValueError("Fusion requires align_item=current and mse_loss_weight=0")
+    fusion_config = dict(fusion_mode=fusion_mode, fusion_position=fusion_position)
     alignment_config = dict(
         align_target=align_target, align_item=align_item, mse_loss_weight=mse_loss_weight,
         mse_loss_mode=mse_loss_mode, align_loss_type=align_loss_type,
         cos_loss_weight=cos_loss_weight,
     )
     model_config = dict(model_config or {})
+    if any(key in model_config for key in ("fusion_mode", "fusion_position", "fusion_dim")):
+        raise ValueError("Use train.fusion_mode/fusion_position instead of model_config overrides")
+    if any(key in model_config for key in nitp_config):
+        raise ValueError("Use train.nitp_weight/nitp_target_layer instead of model_config overrides")
     architecture = {
         "tiger": dict(num_layers=num_layers, num_decoder_layers=num_decoder_layers,
                       d_model=d_model, d_ff=d_ff, num_heads=num_heads, d_kv=d_kv,
@@ -250,6 +273,10 @@ def train(
     model_config.update({
         key: value for key, value in architecture[model_name].items() if value is not None
     })
+    if nitp_weight > 0:
+        depth = model_config.get("num_decoder_layers" if model_name == "tiger" else "num_blocks", 4)
+        validate_nitp(nitp_weight, nitp_target_layer, depth)
+        model_config.update(nitp_config)
     set_seed(seed)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     paths = {"model": model_name, "split": get_run_split("beauty")}
@@ -265,6 +292,15 @@ def train(
             ratio_tag = f"_cw{cos_loss_weight}"
             artifact_suffix += ratio_tag
             save_dir_root += ratio_tag
+    if fusion_enabled:
+        fusion_tag = f"fusion_{fusion_mode}_{fusion_position}_{align_target}_current"
+        save_dir_root = os.path.join(save_dir_root, fusion_tag)
+        artifact_suffix = f"_{fusion_tag}"
+    if nitp_weight > 0:
+        nitp_tag = f"nitp_w{nitp_weight:g}_layer{nitp_target_layer}"
+        directory_tag = nitp_tag + (artifact_suffix if mse_loss_weight > 0 else "")
+        save_dir_root = os.path.join(save_dir_root, directory_tag)
+        artifact_suffix += f"_{nitp_tag}"
     logger = setup_logger(save_dir_root, name=f"{model_name}{artifact_suffix}")
 
     if dataset is None:
@@ -275,7 +311,7 @@ def train(
             root=dataset_folder, train_test_split=split, max_seq_len=max_seq_len,
             pretrained_rqvae_path=pretrained_rqvae_path,
             **(dict(align_target=align_target, align_item=align_item)
-               if split == "train" and mse_loss_weight > 0 else {}),
+               if fusion_enabled or (split == "train" and mse_loss_weight > 0) else {}),
         )
         for split in ("train", "valid", "test")
     }
@@ -285,6 +321,7 @@ def train(
         sid_collate, codebook_size=codebook_size, sem_id_dim=sem_id_dim,
         max_seq_len=max_seq_len,
         require_timestamps=model_name == "hstu" and model_config.get("use_temporal_bias", False),
+        fusion=fusion_enabled,
     )
     loaders = {
         split: DataLoader(
@@ -294,6 +331,16 @@ def train(
         )
         for split, value in datasets.items()
     }
+    if fusion_enabled:
+        dimensions = []
+        for split, value in datasets.items():
+            embedding = getattr(value[0], "align_target_emb", None)
+            if embedding is None or torch.as_tensor(embedding).ndim != 1:
+                raise ValueError(f"{split} dataset must provide a current-item embedding vector")
+            dimensions.append(len(embedding))
+        if len(set(dimensions)) != 1 or dimensions[0] <= 0:
+            raise ValueError("Fusion embedding dimensions must match across dataset splits")
+        model_config.update(**fusion_config, fusion_dim=dimensions[0])
     model = build_sid_model(
         model_name, codebook_size, sem_id_dim, max_seq_len, model_config
     ).to(device)
@@ -323,6 +370,8 @@ def train(
         f"Samples: { {key: len(value) for key, value in datasets.items()} }"
     )
     logger.info(f"Alignment: {alignment_config}")
+    logger.info(f"Fusion: {fusion_config}, output: {save_dir_root}")
+    logger.info(f"NITP: {nitp_config}")
     monitor = "ce" if early_stop_metric == "ce" else f"Recall@{max(top_ks)}"
     logger.info(
         f"Early stopping: {early_stop_metric}, monitor: {monitor}, "
@@ -342,6 +391,8 @@ def train(
                 "early_stop_metric": early_stop_metric,
                 "early_stop_patience": early_stop_patience,
                 **alignment_config,
+                **fusion_config,
+                **nitp_config,
             },
         )
 
@@ -360,6 +411,7 @@ def train(
         loss_sum = 0.0
         ntp_loss_sum = 0.0
         align_loss_sum = 0.0
+        nitp_loss_sum = 0.0
         sample_count = 0
         for batch in tqdm(loaders["train"], desc=f"Epoch {epoch}"):
             inp = move_batch(batch, device)
@@ -370,9 +422,12 @@ def train(
                     compute_alignment_loss(model, output, inp, align_loss_type, cos_loss_weight)
                     if mse_loss_weight > 0 else output.logits.new_zeros(())
                 )
+                auxiliary_loss = output.nitp_loss if nitp_weight > 0 else output.logits.new_zeros(())
+                if auxiliary_loss is None:
+                    raise RuntimeError("Model returned a missing NITP loss")
             if output.loss is None or not torch.isfinite(output.loss):
                 raise RuntimeError("Model returned a missing or non-finite NTP loss")
-            loss = output.loss + mse_loss_weight * align_loss
+            loss = output.loss + mse_loss_weight * align_loss + nitp_weight * auxiliary_loss
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite combined alignment loss")
             loss.backward()
@@ -383,22 +438,26 @@ def train(
             loss_sum += loss.item() * size
             ntp_loss_sum += output.loss.item() * size
             align_loss_sum += align_loss.item() * size
+            nitp_loss_sum += auxiliary_loss.item() * size
             sample_count += size
             global_step += 1
             if wandb is not None and global_step % wandb_log_interval == 0:
                 wandb.log({
                     "global_step": global_step, "train/loss": loss.item(),
                     "train/ntp_loss": output.loss.item(), "train/align_loss": align_loss.item(),
+                    "train/nitp_loss": auxiliary_loss.item(),
                 })
 
         log = {
             "epoch": epoch, "train/loss": loss_sum / sample_count,
             "train/ntp_loss": ntp_loss_sum / sample_count,
             "train/align_loss": align_loss_sum / sample_count,
+            "train/nitp_loss": nitp_loss_sum / sample_count,
         }
         logger.info(
             f"Epoch {epoch} - loss: {log['train/loss']:.6f}, "
-            f"ntp: {log['train/ntp_loss']:.6f}, align: {log['train/align_loss']:.6f}"
+            f"ntp: {log['train/ntp_loss']:.6f}, align: {log['train/align_loss']:.6f}, "
+            f"nitp: {log['train/nitp_loss']:.6f}"
         )
         if epoch == 0 or (epoch + 1) % eval_valid_every_n_epochs == 0:
             if early_stop_metric == "ce":
@@ -443,6 +502,8 @@ def train(
         "model_config": model_config or {}, "codebook_size": codebook_size,
         "sem_id_dim": sem_id_dim, "max_seq_len": max_seq_len,
         **alignment_config,
+        **fusion_config,
+        **nitp_config,
     }
     with open(os.path.join(save_dir_root, "results.json"), "w") as handle:
         json.dump(results, handle, indent=2)

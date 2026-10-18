@@ -221,3 +221,4 @@ tests/
 
 .dbg/
 out_*/
+debug/

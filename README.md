@@ -292,6 +292,66 @@ python -m trainers.general_trainer config/tiger.gin --split beauty \
 
 启用对齐时，checkpoint 和日志文件名均包含 target、方向、权重及模式，例如 `best_model_quantized_current_cos5_last.pt`、`tiger_quantized_current_cos5_last_20261016_120000.log`。关闭对齐时仍使用 `best_model.pt` 和原来的日志命名。
 
+### TIGER / HSTU 直接融合对照
+
+`train.fusion_mode='none'` 默认关闭。开启时支持 TIGER 和 HSTU，要求 `train.align_item='current'`、`train.mse_loss_weight=0`，只优化 NTP，不叠加 align loss。`train.align_target` 选择 `item / latent / quantized`，取最后一个历史物品的冻结 embedding，训练、验证和推理均需提供。
+
+- `train.fusion_mode='add'`：`h' = h + MLP(emb)`。
+- `train.fusion_mode='concat'`：`h' = MLP([h, emb])`。
+- 两种 MLP 都是 `Linear(input_dim, hdim) -> GELU -> Linear(hdim, hdim)`，两层带 bias，无额外 dropout，输出维度不变。
+- TIGER `train.fusion_position='out'`：在 decoder 最终归一化/dropout 之后、原输出缩放和 LM head 之前，只融合 decoder 起始 PAD 位置。直接改变 SID1 logits，不改 KV；给定相同目标前缀时，SID2/3 logits 不变。生成时仍会通过 SID1 的选择和 beam 分数产生间接影响。
+- TIGER `train.fusion_position='attn'`：在最后一个 decoder block 的 self-attention 中，对起始 PAD 位置的归一化输入做融合，再经原 K/V 投影得到替换值；Q、残差输入、其他位置、其他层和 cross-attention K/V 均不改。SID1/2/3 都能读取这个位置。这里不是修改 encoder 最后历史位置，也不是每一步修改最新生成 token 的 K/V。
+
+训练和无缓存解码均在完整 decoder 前缀的位置 0 做同样操作；缓存解码只在首步生成融合 K/V，随后复用并随父 beam 重排，不重复融合。批数据使用 `fusion_emb`，与仅用于辅助损失的 `align_target_emb` 分离；推理仍不读取目标 labels。
+
+HSTU 对应的位置是**最后历史物品的最后一个 SID token**，不是 PAD。`out` 在 `final_norm` 后、原 tied head 前只改该位置；`attn` 在最后 HSTU 层融合该位置的原层输入，再走原 `SiLU(Linear(...))`，只取融合后的 V/K 分量替换原 V/K，U/Q、残差、其他位置及其他层保持不变。HSTU 原本没有 attention 输入归一化，这里不额外添加。当前 HSTU 仍逐步重算完整前缀，没有引入 KV cache；每一步都使用固定索引 `history_width - 1`，不融合新生成的 SID1/2 位置。两种位置均支持现有时间戳分支。
+
+例如 Add + attn + quantized：
+
+```bash
+bash scripts/train.sh tiger beauty \
+  --gin "train.fusion_mode='add'" \
+  --gin "train.fusion_position='attn'" \
+  --gin "train.align_target='quantized'" \
+  --gin "train.align_item='current'" \
+  --gin "train.mse_loss_weight=0" \
+  --gin "train.save_dir_root='out_fusion/tiger/amazon/{split}/lr1e-4'"
+```
+
+HSTU 使用相同参数，将命令中的模型改为 `hstu`，输出根目录改为 `out_fusion/hstu/amazon/{split}/lr1e-4`；若沿用这个目录名，请显式加 `--gin "train.learning_rate=1e-4"`，HSTU 原配置默认学习率是 `1e-3`，本次没有修改。
+
+在指定根目录下自动新增 `fusion_add_attn_quantized_current/` 子目录，其他组合分别隔离；不同学习率、种子或重复批次仍需指定不同根目录。日志、checkpoint 文件名包含融合配置，`results.json` 同时保存模式、位置和包含 `fusion_dim` 的 `model_config`。加载时用该 `model_config` 构建对应模型，再加载 state dict；只保存模型和 MLP 权重，不保存逐物品 embedding 表，推理需要复用相同数据编码器/RQVAE 生成的特征。融合仅支持 `model(inp)` / `model.generate(inp)` 的 SID 字典接口，旧的裸 tensor 接口会明确报错，防止静默跳过融合。
+
+### NITP 辅助监督（TIGER / HSTU）
+
+独立参数 `train.nitp_weight=0.0` 默认关闭；`train.nitp_target_layer=1`
+按 block 从 1 编号，可分别尝试 1/2/3 层，不能超过模型实际层数。
+TIGER 取 decoder block 输出，HSTU 取 HSTU block 输出，均在最终归一化之前。
+这不是 `align_targets` 的 item/latent/quantized 外部向量。
+
+开启后，仅训练时追加完整目标 SID（包括 SID3）。用最后历史位置（TIGER 为
+decoder 起始 PAD）、SID1、SID2 的最终 hidden，经独立 SwiGLU 投影头，
+预测 SID1、SID2、SID3 在指定浅层的 detached hidden，cosine loss 对 batch
+和三个目标位置取平均。原 NTP 仍只预测三个目标 token，因果 mask 不变。
+验证 CE 和生成都不计算 NITP，不需要额外目标 token 或修改 KV cache。
+
+总损失为 `NTP + mse_loss_weight * align + nitp_weight * NITP`。
+日志单独打印 `nitp`；输出自动增加 `nitp_w{weight}_layer{layer}` 子目录，
+与原实验隔离，开启外部 align 时目录同时包含其配置。
+`results.json` 和 `model_config` 记录 NITP 参数，checkpoint 包含投影头。
+关闭时不创建投影头，保留原模型参数结构和前向路径。
+
+```bash
+bash scripts/train.sh hstu beauty \
+  --gin "train.nitp_weight=0.5" \
+  --gin "train.nitp_target_layer=2" \
+  --gin "train.mse_loss_weight=0" \
+  --gin "train.fusion_mode='none'"
+```
+
+换成 `tiger` 可运行 TIGER；将层号分别改为 1/2/3 做独立实验。
+默认训练设置和当前网格选择未改，不会自动提交实验。
+
 ## 7. 输出文件
 
 | 模型 | Beauty 默认输出目录 |
