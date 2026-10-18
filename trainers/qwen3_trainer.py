@@ -33,6 +33,8 @@ def setup_training_logger(accelerator, save_dir, config, paths):
             f"_{config['align_target']}_{config['align_item']}"
             f"_{config['align_loss_type']}{config['mse_loss_weight']:g}_{config['align_source']}"
         )
+        if config["align_loss_type"] == "cosgram" and config.get("cos_loss_weight", 0.5) != 0.5:
+            name += f"_cw{config['cos_loss_weight']}"
     if not accelerator.is_main_process:
         # No file/console handlers on workers, including when root logging is enabled.
         logger = logging.Logger(name)
@@ -46,8 +48,9 @@ def setup_training_logger(accelerator, save_dir, config, paths):
         effective[key] = config[key].format(**paths)
     effective.update(split=paths["split"], save_dir_root=save_dir)
     logger.info("Effective training arguments:\n%s", json.dumps(effective, indent=2))
-    logger.info("Alignment: %s", {key: config[key] for key in (
+    logger.info("Alignment: %s", {key: config.get(key, 0.5) for key in (
         "align_target", "align_item", "mse_loss_weight", "align_source", "align_loss_type",
+        "cos_loss_weight",
     )})
     logger.info(
         "Batch: per-device=%d, accumulation=%d, world_size=%d, effective=%d",
@@ -189,6 +192,7 @@ def train_lcrec(
     align_item="current",
     align_source="last_inp",
     align_loss_type="cos",
+    cos_loss_weight=0.5,
     wandb_logging=False,
     linear_probe=None,
     linear_probe_every_steps=50,
@@ -234,6 +238,8 @@ def train_lcrec(
         raise ValueError("Invalid worker count, warmup or learning-rate schedule")
     if not math.isfinite(mse_loss_weight) or mse_loss_weight < 0:
         raise ValueError("mse_loss_weight must be finite and nonnegative")
+    if not 0 <= cos_loss_weight <= 1:
+        raise ValueError("cos_loss_weight must be finite and in [0, 1]")
     if align_target not in ("item", "latent", "quantized") or align_item not in ("current", "next"):
         raise ValueError("Invalid alignment target or item")
     if quantizer == "rqkmeans" and align_target == "latent" and mse_loss_weight > 0:
@@ -252,6 +258,8 @@ def train_lcrec(
     save_dir = save_dir_root.format(**paths)
     if mse_loss_weight > 0:
         save_dir += f"_{align_target}_{align_item}_{align_source}_{align_loss_type}{mse_loss_weight:g}"
+        if align_loss_type == "cosgram" and cos_loss_weight != 0.5:
+            save_dir += f"_cw{cos_loss_weight}"
     logger = setup_training_logger(accelerator, save_dir, run_config, paths)
     sequence_config = dict(
         enabled=sequence_geometry, cosine_pairs_per_batch=sequence_geometry_cosine_pairs,
@@ -320,6 +328,7 @@ def train_lcrec(
             lora_dropout=lora_dropout, lora_target_modules=lora_target_modules,
             gradient_checkpointing=gradient_checkpointing, align_dim=align_dim,
             align_source=align_source, align_loss_type=align_loss_type,
+            cos_loss_weight=cos_loss_weight,
         )
     optimizer = AdamW((p for p in model.parameters() if p.requires_grad),
                       lr=learning_rate, weight_decay=weight_decay)
